@@ -195,11 +195,11 @@ def roll_out(
 
         a = actions[..., 0].repeat_interleave(action_len, dim=-1) 
         v = v.unsqueeze(-1) + torch.cumsum(a * dt, dim=-1) 
-        v += torch.randn_like(v) * 0.1
+        # Note: Removed random noise that was added during rollout
+        # This noise interferes with deterministic inference
         v = torch.clamp(v, min=0)
 
-        yaw_rate = actions[..., 1].repeat_interleave(action_len, dim=-1) 
-        yaw_rate += torch.randn_like(yaw_rate) * 0.01
+        yaw_rate = actions[..., 1].repeat_interleave(action_len, dim=-1)
 
         if global_frame:
             theta = theta.unsqueeze(-1) + torch.cumsum(yaw_rate * dt, dim=-1)

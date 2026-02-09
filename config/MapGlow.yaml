@@ -1,0 +1,87 @@
+# MapGlow Configuration
+# Based on VBD config structure for full compatibility
+
+model_name: MapGlow
+
+# Data Config (same as VBD)
+train_data_path: null  # Set this to your training data directory
+val_data_path: null    # Set this to your validation data directory
+anchor_path: ./vbd/data/cluster_64_center_dict.pkl
+log_dir: ./train_log
+
+# Wandb Config (same as VBD)
+use_wandb: True
+# 兼容旧字段（不建议再用个人实体）
+username: anthonywang4work
+# 推荐填写团队 entity（例如你的 wandb team 名），否则可能触发 personal entity 403
+wandb_entity: anthonywang4work-southern-university-of-science-technology
+wandb_mode: online   # online/offline/disabled
+wandb_name: null
+project: MapGlow
+
+# Checkpoint Config (same as VBD)
+init_from: null   # Resume training from lightning checkpoint
+ckpt_path: null   # Load model weights only
+
+# Scene Config (same as VBD)
+agents_len: 32      # Maximum number of agents
+future_len: 80      # Future trajectory length (timesteps)
+history_len: 11     # History trajectory length (timesteps)
+
+# MapGlow Model Config
+in_channel: 5         # Input channels: x, y, vx, vy, yaw
+condition_dim: 256    # Condition embedding dimension (match encoder output)
+n_flow: 32             # Number of flows per block (reduced from 16 for stability)
+n_block: 3            # Number of blocks (reduced from 3 for initial training)
+affine: True          # Use affine coupling (True) or additive (False)
+conv_lu: True         # Use LU decomposition for 1x1 conv
+temperature: 0.7      # Sampling temperature
+num_lane_types: 21    # Waymax roadgraph lane/polyline type classes
+num_traffic_light_states: 9  # Waymax traffic light state classes
+lane_type_encoding: embedding   # onehot / embedding
+lane_type_embed_dim: 32      # embedding dim for lane type id
+lane_tl_embed_dim: 16        # embedding dim for lane traffic-light state id
+tl_state_embed_dim: 16       # embedding dim for standalone traffic-light tokens
+use_traffic_light: True     # debug开关：关闭独立traffic light token分支
+use_lane_tl_in_map: True    # debug开关：关闭map中的lane traffic light状态特征
+lane_selection_mode: hybrid # topk / all / hybrid
+topk_lanes: 16               # used in topk/hybrid
+hybrid_global_lanes: 64      # extra global lanes in hybrid mode
+agent_shape_scale: [10.0, 5.0, 3.0]  # normalize [length, width, height]
+
+# Training Params (same as VBD)
+seed: 42
+batch_size: 1
+num_workers: 0
+lr: 0.0001           # Reduced learning rate for normalizing flow stability
+weight_decay: 0.000001  # Reduced weight decay
+epochs: 100
+lr_warmup_step: 2000  # Longer warmup
+lr_step_freq: 1000
+lr_step_gamma: 0.98
+gradient_clip_val: 1  # Stricter gradient clipping
+
+# Logging (same as VBD)
+log_every_n_steps: 100
+save_top_k: 3
+use_val: False
+
+# Sampling visualization during training
+sample_every_n_steps: 2000   # 0 to disable
+sample_vis_max_agents: 32
+sample_n_samples: 5
+sample_temperature: 0.7
+sample_use_waymax_vis: False
+sample_raw_data_path: /home/anthony/WaymoMotionV1_2/validation
+sample_raw_max_scan: 50000
+sample_rotate_scene: true
+
+# Precision (use 32 for initial training to avoid numerical issues)
+precision: 32  # Options: 32, 16, bf16-mixed
+
+# Hardware (override via command line, same as VBD)
+num_nodes: 1
+num_gpus: -1  # -1 means use all available GPUs
+
+train_data_path: ../WaymoMotionV1_2/train_processed/processed/
+val_data_path: ../WaymoMotionV1_2/processed/

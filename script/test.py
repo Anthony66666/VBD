@@ -20,6 +20,7 @@ jax.config.update('jax_platform_name', 'cpu')
 from vbd.data.dataset import WaymaxTestDataset
 from vbd.model.utils import set_seed
 from vbd.sim_agent.sim_actor import VBDTest, sample_to_action
+from vbd.model.FlowMatching import FlowMatching
 from vbd.waymax_visualization.plotting import plot_state
 
 # waymax
@@ -103,11 +104,26 @@ def calculate_metrics(metrics, modeled_indices):
 
 
 ## Begin Simulation
+def _batch_to_device(batch, device):
+    for key, value in batch.items():
+        if isinstance(value, torch.Tensor):
+            batch[key] = value.to(device)
+    return batch
+
+
 def run_simulation(args):
     ## Load model
-    vbd = VBDTest.load_from_checkpoint(args.model_path, args.device)
-    vbd.reset_agent_length(N_SIM_AGENTS)
-    vbd.eval()
+    if args.model_type == 'vbd':
+        vbd = VBDTest.load_from_checkpoint(args.model_path, args.device)
+        vbd.reset_agent_length(N_SIM_AGENTS)
+        vbd.eval()
+    elif args.model_type == 'flowmatching':
+        vbd = FlowMatching.load_from_checkpoint(args.model_path, map_location=args.device)
+        vbd.to(args.device)
+        vbd.eval()
+    else:
+        raise ValueError(f"Unknown model_type: {args.model_type}")
+
     set_seed(args.seed)  
     
     # Load testing scenarios
@@ -150,19 +166,43 @@ def run_simulation(args):
                     sample = dataset.process_scenario(current_state, current_state.timestep, use_log=False)
                     batch = dataset.__collate_fn__([sample])
 
-                    if args.test_mode == 'diffusion':
-                        pred = vbd.sample_denoiser(batch)
-                        pred_traj = pred['denoised_trajs'].cpu().numpy()[0]
+                    if args.model_type == 'vbd':
+                        if args.test_mode == 'diffusion':
+                            pred = vbd.sample_denoiser(batch)
+                            pred_traj = pred['denoised_trajs'].cpu().numpy()[0]
 
-                    elif args.test_mode == 'prior':
-                        pred = vbd.inference_predictor(batch)
-                        scores = pred['goal_scores'][0].softmax(dim=-1)
-                        trajs = pred['goal_trajs'][0]
-                        sampled_idx = torch.multinomial(scores, 1).squeeze()
-                        pred_traj = trajs[torch.arange(sampled_idx.shape[0]), sampled_idx].cpu().numpy()
+                        elif args.test_mode == 'prior':
+                            pred = vbd.inference_predictor(batch)
+                            scores = pred['goal_scores'][0].softmax(dim=-1)
+                            trajs = pred['goal_trajs'][0]
+                            sampled_idx = torch.multinomial(scores, 1).squeeze()
+                            pred_traj = trajs[torch.arange(sampled_idx.shape[0]), sampled_idx].cpu().numpy()
 
-                    else:
-                        raise NotImplementedError
+                        else:
+                            raise NotImplementedError
+
+                    elif args.model_type == 'flowmatching':
+                        batch = _batch_to_device(batch, args.device)
+
+                        if args.test_mode == 'flow':
+                            pred = vbd.sample_actions(
+                                batch,
+                                num_steps=args.flow_num_steps,
+                                t_start=1.0,
+                                t_end=0.0,
+                            )
+                            pred_traj = pred['trajs'].cpu().numpy()[0]
+
+                        elif args.test_mode == 'prior':
+                            encoder_outputs = vbd.encoder(batch)
+                            pred = vbd.forward_predictor(encoder_outputs)
+                            scores = pred['goal_scores'][0].softmax(dim=-1)
+                            trajs = pred['goal_trajs'][0]
+                            sampled_idx = torch.multinomial(scores, 1).squeeze()
+                            pred_traj = trajs[torch.arange(sampled_idx.shape[0]), sampled_idx].cpu().numpy()
+
+                        else:
+                            raise NotImplementedError
 
             sample = pred_traj[:, i, :]
             action = sample_to_action(sample, is_controlled, None, N_SIM_AGENTS)
@@ -213,7 +253,9 @@ if __name__ == '__main__':
     parser.add_argument('--test_path', type=str, default=None)
     parser.add_argument('--model_path', type=str, default=None)
     parser.add_argument('--replan', type=int, default=10, help='Replan frequency')
+    parser.add_argument('--model_type', type=str, default='vbd', choices=['vbd', 'flowmatching'])
     parser.add_argument('--test_mode', type=str, default='diffusion')
+    parser.add_argument('--flow_num_steps', type=int, default=50)
     parser.add_argument('--save_simulation', action='store_true')
 
     args = parser.parse_args()

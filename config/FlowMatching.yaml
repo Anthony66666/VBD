@@ -1,0 +1,96 @@
+model_name: FlowMatching
+
+# Data Config
+# REQUIRED: Set these paths to your training and validation data directories
+# Example: train_data_path: /path/to/waymax/training_data
+#          val_data_path: /path/to/waymax/validation_data
+train_data_path: null  # MUST BE SET BEFORE TRAINING
+val_data_path: null    # MUST BE SET BEFORE TRAINING
+anchor_path: ./vbd/data/cluster_64_center_dict.pkl
+log_dir: ./train_log
+
+# Wandb Config
+use_wandb: False
+username: null
+project: null
+
+# Checkpoint Config
+init_from: null
+ckpt_path: null
+encoder_ckpt: null
+
+# Model Config
+agents_len: 32
+future_len: 80
+action_len: 5  # Number of time steps per action group (80/5=16 groups), NOT action dimension
+encoder_layers: 6
+encoder_version: v2
+
+# =============================================================================
+# Flow Matching Configuration (Rectified Flow / OT-Flow)
+# =============================================================================
+# Mathematical formulation:
+#   x_t = (1-t) * x_0 + t * x_1,  where x_0 = data, x_1 = noise
+#   v = dx/dt = x_1 - x_0 (target velocity)
+#   Network learns: v_θ(x_t, t) ≈ x_1 - x_0
+#   Sampling: integrate dx/dt = v_θ(x, t) from t=1 to t=0
+
+flow_steps: 100       # Number of time embedding bins (higher = finer time resolution)
+flow_sigma: 0.0       # Noise for Conditional FM (0 = deterministic OT path, recommended)
+
+# Action normalization - CRITICAL for balanced learning
+# After normalization, both dimensions should have similar scale (~1.0)
+# Statistics from actual data:
+#   Acceleration: mean=0.27, std=3.55
+#   Yaw Rate: mean=0.00, std=1.59
+action_mean: [0.0, 0.0]
+action_std: [3.5, 1.6]  # Use actual data statistics!
+
+# Trajectory normalization (for trajectory-space Flow Matching)
+# These scale the trajectory dimensions [x, y, θ, vx, vy] to similar magnitudes
+# Typical values for driving scenarios:
+#   x, y position: ~10m range for 8 second prediction
+#   θ (heading): radians, ~1.0 range
+#   vx, vy velocity: ~5 m/s typical
+traj_std: [10.0, 10.0, 1.0, 5.0, 5.0]
+
+# Predictor - DISABLE for pure Flow Matching training (recommended first)
+# GoalPredictor adds complexity, train it separately or after flow converges
+with_predictor: False
+
+# =============================================================================
+# Training Hyperparameters
+# =============================================================================
+seed: 42
+batch_size: 4
+num_workers: 16
+
+# Learning rate schedule
+lr: 0.0001            # Lower LR for stability (Flow Matching is sensitive)
+weight_decay: 0.01
+epochs: 32            # More epochs for better convergence
+lr_warmup_step: 1000  # Longer warmup helps stability
+lr_step_freq: 3000
+lr_step_gamma: 0.96
+gradient_clip_val: 0.5  # Tighter gradient clipping
+
+# Component training flags
+train_encoder: True
+train_flow: True
+train_predictor: False  # Disable until flow converges
+
+# =============================================================================
+# Visualization & Logging
+# =============================================================================
+vis_every_n_epochs: 1
+vis_max_agents: 32
+vis_flow_steps: 50
+vis_method: euler
+
+# Inference settings
+inference_steps: 50
+inference_method: euler
+
+# Hardware
+num_nodes: 1
+num_gpus: -1

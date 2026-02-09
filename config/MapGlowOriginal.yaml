@@ -1,0 +1,73 @@
+# MapGlow Configuration
+# Based on VBD config structure for full compatibility
+
+model_name: MapGlow
+
+# Data Config (same as VBD)
+train_data_path: null  # Set this to your training data directory
+val_data_path: null    # Set this to your validation data directory
+anchor_path: ./vbd/data/cluster_64_center_dict.pkl
+log_dir: ./train_log
+
+# Wandb Config (same as VBD)
+use_wandb: False
+# 兼容旧字段（不建议再用个人实体）
+username: anthonywang4work
+# 推荐填写团队 entity（例如你的 wandb team 名），否则可能触发 personal entity 403
+wandb_entity: anthonywang4work-southern-university-of-science-technology
+wandb_mode: online   # online/offline/disabled
+wandb_name: null
+project: MapGlow
+
+# Checkpoint Config (same as VBD)
+init_from: null   # Resume training from lightning checkpoint
+ckpt_path: null   # Load model weights only
+
+# Scene Config (same as VBD)
+agents_len: 32      # Maximum number of agents
+future_len: 80      # Future trajectory length (timesteps)
+history_len: 11     # History trajectory length (timesteps)
+
+# MapGlow Model Config
+in_channel: 5         # Input channels: x, y, vx, vy, yaw
+condition_dim: 256    # Condition embedding dimension (match encoder output)
+n_flow: 8             # Number of flows per block (reduced from 16 for stability)
+n_block: 2            # Number of blocks (reduced from 3 for initial training)
+affine: True          # Use affine coupling (True) or additive (False)
+conv_lu: True         # Use LU decomposition for 1x1 conv
+temperature: 0.7      # Sampling temperature
+valid_eps: 1.0e-6
+use_agent_interaction: False   # Keep context encoder simple first
+use_lane_aware: False          # Keep context encoder simple first
+
+# Training Params (same as VBD)
+seed: 42
+batch_size: 4
+num_workers: 0
+lr: 0.0001           # Reduced learning rate for normalizing flow stability
+weight_decay: 0.000001  # Reduced weight decay
+epochs: 100
+lr_warmup_step: 2000  # Longer warmup
+lr_step_freq: 1000
+lr_step_gamma: 0.98
+gradient_clip_val: 1  # Stricter gradient clipping
+
+# Logging (same as VBD)
+log_every_n_steps: 100
+save_top_k: 20
+use_val: True
+
+# Sampling visualization during training
+sample_every_n_steps: 2000   # 0 to disable
+sample_vis_max_agents: 32
+sample_n_samples: 5
+sample_temperature: 0.7
+
+# Precision (use 32 for initial training to avoid numerical issues)
+precision: 32  # Options: 32, 16, bf16-mixed
+
+# Hardware (override via command line, same as VBD)
+num_nodes: 1
+num_gpus: -1  # -1 means use all available GPUs
+
+train_data_path: ../WaymoMotionV1_2/train_processed/processed/

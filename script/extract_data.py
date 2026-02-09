@@ -1,4 +1,12 @@
 import os
+import sys
+from pathlib import Path
+
+# Add VBD to path
+vbd_root = Path(__file__).parent.parent.absolute()
+if str(vbd_root) not in sys.path:
+    sys.path.insert(0, str(vbd_root))
+
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 # disable GPU
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
@@ -31,6 +39,7 @@ def data_process(
     save_dir: str, 
     save_raw: bool = False,
     only_raw: bool = False,
+    delete_source: bool = False,
 ):
     """
     Process the Waymax dataset and save the processed data.
@@ -39,6 +48,7 @@ def data_process(
         data_dir (str): Directory path of the Waymax dataset.
         save_dir (str): Directory path to save the processed data.
         save_raw (bool, optional): Whether to save the raw scenario data. Defaults to False.
+        delete_source (bool, optional): Whether to delete the source file after processing. Defaults to False.
     """
     # Waymax Dataset
     tf_dataset = dataloader.tf_examples_dataset(
@@ -82,6 +92,13 @@ def data_process(
 
         with open(scenario_filename, 'wb') as f:
             pickle.dump(data_dict, f)
+
+    if delete_source:
+        try:
+            os.remove(data_dir)
+            print(f"Deleted source file: {data_dir}")
+        except Exception as e:
+            print(f"Error deleting source file {data_dir}: {e}")
         
 
 if __name__ == '__main__': 
@@ -91,6 +108,7 @@ if __name__ == '__main__':
     parser.add_argument('--save_dir', type=str, default='/data/Dataset/Waymo/VBD')
     parser.add_argument('--save_raw', action='store_true')
     parser.add_argument('--only_raw', action='store_true')
+    parser.add_argument('--delete_source', action='store_true', help='Delete source file after processing')
     parser.add_argument('--num_workers', type=int, default=16)
     args = parser.parse_args()
     
@@ -122,6 +140,7 @@ if __name__ == '__main__':
             save_dir=save_dir,
             save_raw=save_raw,
             only_raw=only_raw,
+            delete_source=args.delete_source,
         )
         process_map(data_process_partial, data_files, max_workers=args.num_workers)
         

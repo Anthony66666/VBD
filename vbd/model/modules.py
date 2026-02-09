@@ -117,21 +117,37 @@ class GoalPredictor(nn.Module):
 
 
 class Denoiser(nn.Module):
-    def __init__(self, future_len=80, action_len=5, agents_len=32, steps=100, input_dim=5):
+    def __init__(self, future_len=80, action_len=5, agents_len=32, steps=100, input_dim=5, output_dim=2, causal=True):
         super().__init__()
         self._agents_len = agents_len
         self._action_len = action_len
         self._input_dim = input_dim
+        self._output_dim = output_dim
         self.noise_level_embedding = nn.Embedding(steps, 256)
-        self.decoder = TransformerDecoder(future_len, agents_len, self._action_len, input_dim=self._input_dim)
+        self.decoder = TransformerDecoder(
+            future_len, agents_len, self._action_len, 
+            input_dim=self._input_dim, 
+            ouptut_dim=self._output_dim,  # Note: typo in original code
+            causal=causal
+        )
 
-    def forward(self, encoder_inputs, noisy_actions, diffusion_step, rollout = True):
+    def forward(
+        self,
+        encoder_inputs,
+        noisy_actions,
+        diffusion_step,
+        rollout=True,
+        actions_normalized=False,
+        action_mean=None,
+        action_std=None,
+    ):
         '''
         Args:
-            noisy_actions: [B, A, T_r, 2], [acc, yaw_rate] Unnormalized actions
+            noisy_actions: Either [B, A, T_r, 2] for actions (rollout=True) or
+                          [B, A, T_f, 5] for trajectories (rollout=False with input_dim=5)
             diffusion_step: [B, A]
         Output:
-            denoised_states: [B, A, T, 3], [x, y, theta]
+            denoised_states: [B, A, T, output_dim] (default output_dim=2 for actions)
         '''
         noisy_actions = noisy_actions[:, :self._agents_len]
         
@@ -155,11 +171,31 @@ class Denoiser(nn.Module):
 
         # denoise step
         noise_level = self.noise_level_embedding(diffusion_step)
+        
         if rollout:
-            embedding = roll_out(current_states, noisy_actions,
-                                    action_len=self._action_len, global_frame=False)   
+            # Input is actions [B, A, T_actions, 2], rollout to trajectory
+            rollout_actions = noisy_actions
+            if actions_normalized:
+                if action_mean is None or action_std is None:
+                    raise ValueError("action_mean and action_std must be provided when actions_normalized=True")
+                rollout_actions = noisy_actions * action_std + action_mean
+
+            embedding = roll_out(
+                current_states,
+                rollout_actions,
+                action_len=self._action_len,
+                global_frame=False,
+            )
         else:
-            embedding = noisy_actions
+            # rollout=False: input could be actions or trajectories
+            # Check input dimension to determine how to handle it
+            if noisy_actions.shape[-1] == self._input_dim and noisy_actions.shape[-2] == 80:
+                # Input is already a trajectory [B, A, 80, 5], pass directly
+                embedding = noisy_actions
+            else:
+                # Input is actions [B, A, T_actions, 2], expand via repeat_interleave
+                # This is for backward compatibility with action-space models
+                embedding = noisy_actions.repeat_interleave(self._action_len, dim=2)
         
         decoder_output = self.decoder(
             embedding, noise_level, 

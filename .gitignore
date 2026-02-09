@@ -1,6 +1,7 @@
 wandb/
 output/
 weights/
+train_log/
 quant*
 VPD_V1
 results
@@ -21,7 +22,8 @@ results
 *.log
 *.jpg
 *.pcd
-
+*.png
+wang_*.bin
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

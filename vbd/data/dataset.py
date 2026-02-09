@@ -22,10 +22,32 @@ class WaymaxDataset(Dataset):
     def __init__(
         self,
         data_dir,
-        anchor_path = "data/cluster_64_center_dict.pkl",
+        anchor_path = None,
+        verbose = True,
+        max_samples = None,
     ):
+        if verbose:
+            print(f"    Scanning directory: {data_dir}", flush=True)
         self.data_list = glob.glob(data_dir+'/*') if data_dir is not None else []
-        self.anchors = pickle.load(open(anchor_path, "rb"))
+        if max_samples is not None and len(self.data_list) > max_samples:
+            self.data_list = self.data_list[:max_samples]
+            if verbose:
+                print(f"    Found {len(self.data_list)} files (limited to {max_samples})", flush=True)
+        elif verbose:
+            print(f"    Found {len(self.data_list)} files", flush=True)
+        
+        # Load anchors only if path is provided
+        if anchor_path is not None:
+            if verbose:
+                print(f"    Loading anchors from: {anchor_path}", flush=True)
+            self.anchors = pickle.load(open(anchor_path, "rb"))
+        else:
+            self.anchors = None
+            if verbose:
+                print(f"    No anchors loaded (anchor_path is None)", flush=True)
+        
+        if verbose:
+            print(f"    Dataset ready!", flush=True)
         
         self.__collate_fn__ = data_collate_fn
 
@@ -74,8 +96,20 @@ class WaymaxDataset(Dataset):
         traffic_light_points = data['traffic_light_points']
         polylines = data['polylines']
         polylines_valid = data['polylines_valid']
+        agents_history_valid = data.get('agents_history_valid', None)
+        agents_future_valid = data.get('agents_future_valid', None)
+        traffic_light_valid = data.get('traffic_light_valid', None)
+        polylines_point_valid = data.get('polylines_point_valid', None)
         relations = data['relations']
-        anchors = self._process(agents_type)
+        agents_id = data.get('agents_id', None)
+        sdc_id = data.get('sdc_id', None)
+        
+        # Only process anchors if they are available
+        if self.anchors is not None:
+            anchors = self._process(agents_type)
+        else:
+            # Create dummy anchors with zeros if not available
+            anchors = np.zeros((len(agents_type), 64, 2), dtype=np.float32)
 
         tensors = {
             "agents_history": torch.from_numpy(agents_history),
@@ -88,6 +122,19 @@ class WaymaxDataset(Dataset):
             "relations": torch.from_numpy(relations),
             "anchors": torch.from_numpy(anchors)
         }
+        if agents_history_valid is not None:
+            tensors["agents_history_valid"] = torch.from_numpy(agents_history_valid)
+        if agents_future_valid is not None:
+            tensors["agents_future_valid"] = torch.from_numpy(agents_future_valid)
+        if traffic_light_valid is not None:
+            tensors["traffic_light_valid"] = torch.from_numpy(traffic_light_valid)
+        if polylines_point_valid is not None:
+            tensors["polylines_point_valid"] = torch.from_numpy(polylines_point_valid)
+
+        if agents_id is not None:
+            tensors["agents_id"] = torch.from_numpy(agents_id)
+        if sdc_id is not None:
+            tensors["sdc_id"] = torch.as_tensor(sdc_id)
         
         return tensors
 
@@ -103,7 +150,7 @@ class WaymaxTestDataset(WaymaxDataset):
 
     Args:
         data_dir (str): Directory path where the data is stored.
-        anchor_path (str, optional): Path to the anchor file. Defaults to "data/cluster_64_center_dict.pkl".
+        anchor_path (str, optional): Path to the anchor file. Defaults to None.
         max_object (int, optional): Maximum number of objects. Defaults to 16.
         max_polylines (int, optional): Maximum number of polylines. Defaults to 256.
         history_length (int, optional): Length of history. Defaults to 11.
@@ -113,7 +160,7 @@ class WaymaxTestDataset(WaymaxDataset):
     def __init__(
         self,
         data_dir: str,
-        anchor_path = "data/cluster_64_center_dict.pkl",
+        anchor_path = None,
         max_object: int = 16,
         max_map_points: int = 3000,
         max_polylines: int = 256,

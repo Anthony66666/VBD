@@ -262,9 +262,11 @@ def data_process_agent(
     ############# Get agents' trajectory #############
     # feature: x, y, yaw, velx, vely, length, width, height
     agents_history = np.zeros((max_num_objects, current_index+1, 8), dtype=np.float32)
+    agents_history_valid = np.zeros((max_num_objects, current_index+1), dtype=np.int32)
     agents_type = np.zeros((max_num_objects,), dtype=np.int32)
     agents_interested = np.zeros((max_num_objects,), dtype=np.int32)
     agents_future = np.zeros((max_num_objects, log_trajectory.shape[1]-current_index, 5), dtype=np.float32)
+    agents_future_valid = np.zeros((max_num_objects, log_trajectory.shape[1]-current_index), dtype=np.int32)
 
     for i, a in enumerate(agent_ids):
         agent_type = metadata.object_types[a]
@@ -291,7 +293,9 @@ def data_process_agent(
                 log_trajectory.height[a][:current_index+1],
             ])
         
-        agents_history[i][~log_trajectory.valid[a, :current_index+1]] = 0
+        hist_valid = np.asarray(log_trajectory.valid[a, :current_index+1]).astype(np.int32)
+        agents_history_valid[i] = hist_valid
+        agents_history[i][~hist_valid.astype(np.bool_)] = 0
 
         agents_future[i] = np.column_stack([
                 log_trajectory.xy[a][current_index:, 0],
@@ -301,14 +305,26 @@ def data_process_agent(
                 log_trajectory.vel_y[a][current_index:]
             ])
 
-        agents_future[i][~log_trajectory.valid[a, current_index:]] = 0  
+        fut_valid = np.asarray(log_trajectory.valid[a, current_index:]).astype(np.int32)
+        agents_future_valid[i] = fut_valid
+        agents_future[i][~fut_valid.astype(np.bool_)] = 0  
 
     # Remove history
     if remove_history:
         agents_history[:, :-1] = 0
+        agents_history_valid[:, :-1] = 0
     
     
-    return (agents_history, agents_future, agents_interested, agents_type, agent_ids)
+    return (
+        agents_history,
+        agents_history_valid,
+        agents_future,
+        agents_future_valid,
+        agents_interested,
+        agents_type,
+        agent_ids,
+        sdc_id,
+    )
 
 def data_process_traffic_light(
     scenario,
@@ -360,7 +376,16 @@ def data_process_scenario(
     Returns:
         dict: A dictionary containing the processed data.
     """
-    (agents_history, agents_future, agents_interested, agents_type, agents_id) = data_process_agent(
+    (
+        agents_history,
+        agents_history_valid,
+        agents_future,
+        agents_future_valid,
+        agents_interested,
+        agents_type,
+        agents_id,
+        sdc_id,
+    ) = data_process_agent(
         scenario,
         max_num_objects = max_num_objects,
         current_index = current_index,
@@ -373,6 +398,7 @@ def data_process_scenario(
         scenario,
         current_index = current_index,
     )
+    traffic_light_valid = (np.abs(traffic_light_points[:, :2]).sum(axis=-1) > 0).astype(np.int32)
     
     roadgraph_points = scenario.roadgraph_points
     
@@ -398,6 +424,7 @@ def data_process_scenario(
     # get shared map polylines
     # polyline feature: x, y, heading, traffic_light, type
     polylines = []
+    polylines_point_valid = []
     
     roadgraph_points_x = np.asarray(roadgraph_points.x)
     roadgraph_points_y = np.asarray(roadgraph_points.y)
@@ -422,20 +449,27 @@ def data_process_scenario(
         sampled_points = np.linspace(0, polyline_len-1, num_points_polyline, dtype=np.int32)
         cur_polyline = np.take(polyline, sampled_points, axis=0)
         polylines.append(cur_polyline)
+        polylines_point_valid.append(np.ones((num_points_polyline,), dtype=np.int32))
     
     # post processing polylines
     if len(polylines) > 0:
         polylines = np.stack(polylines, axis=0)
+        polylines_point_valid = np.stack(polylines_point_valid, axis=0)
         polylines_valid = np.ones((polylines.shape[0],), dtype=np.int32)
     else:
         polylines = np.zeros((1, num_points_polyline, 5), dtype=np.float32)
+        polylines_point_valid = np.zeros((1, num_points_polyline), dtype=np.int32)
         polylines_valid = np.zeros((1,), dtype=np.int32)
     
     if polylines.shape[0] >= max_polylines:
         polylines = polylines[:max_polylines]
+        polylines_point_valid = polylines_point_valid[:max_polylines]
         polylines_valid = polylines_valid[:max_polylines]
     else:
         polylines = np.pad(polylines, ((0, max_polylines-polylines.shape[0]), (0, 0), (0, 0)))
+        polylines_point_valid = np.pad(
+            polylines_point_valid, ((0, max_polylines-polylines_point_valid.shape[0]), (0, 0))
+        )
         polylines_valid = np.pad(polylines_valid, (0, max_polylines-polylines_valid.shape[0]))
 
     relations = calculate_relations(agents_history, polylines, traffic_light_points)
@@ -443,14 +477,19 @@ def data_process_scenario(
     
     data_dict = {
         'agents_history': np.float32(agents_history),
+        'agents_history_valid': np.int32(agents_history_valid),
         'agents_interested': np.int32(agents_interested),
         'agents_type': np.int32(agents_type),
         'agents_future': np.float32(agents_future), 
+        'agents_future_valid': np.int32(agents_future_valid),
         'traffic_light_points': np.float32(traffic_light_points),
+        'traffic_light_valid': np.int32(traffic_light_valid),
         'polylines': np.float32(polylines),
+        'polylines_point_valid': np.int32(polylines_point_valid),
         'polylines_valid': np.int32(polylines_valid),
         'relations': np.float32(relations),
         'agents_id': np.int32(agents_id),
+        'sdc_id': np.int32(sdc_id),
     }
     return data_dict
 
