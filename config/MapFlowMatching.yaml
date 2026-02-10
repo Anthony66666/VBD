@@ -1,7 +1,7 @@
 # MapGlow Configuration
 # Based on VBD config structure for full compatibility
 
-model_name: MapGlow
+model_name: MapFlowMatching
 
 # Data Config (same as VBD)
 train_data_path: null  # Set this to your training data directory
@@ -17,7 +17,7 @@ username: anthonywang4work
 wandb_entity: anthonywang4work-southern-university-of-science-technology
 wandb_mode: online   # online/offline/disabled
 wandb_name: null
-project: MapGlow
+project: MapFlowMatching
 
 # Checkpoint Config (same as VBD)
 init_from: null   # Resume training from lightning checkpoint
@@ -49,9 +49,18 @@ topk_lanes: 16               # used in topk/hybrid
 hybrid_global_lanes: 64      # extra global lanes in hybrid mode
 agent_shape_scale: [10.0, 5.0, 3.0]  # normalize [length, width, height]
 
+# Flow Matching Config
+flow_steps: 50         # training-time flow matching discretization hint
+sample_steps: 50       # ODE sampling steps at inference/visualization
+fm_hidden_dim: 256
+fm_heads: 8
+fm_layers: 4
+fm_dropout: 0.1
+fm_eval_samples: 1
+
 # Training Params (same as VBD)
 seed: 42
-batch_size: 4
+batch_size: 2
 num_workers: 0
 lr: 0.0001           # Reduced learning rate for normalizing flow stability
 weight_decay: 0.000001  # Reduced weight decay

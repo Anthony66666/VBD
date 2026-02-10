@@ -1911,11 +1911,42 @@ class ContextEncoder(nn.Module):
         }
         return context
 
+
+class BlockContextAdapter(nn.Module):
+    """
+    Lightweight per-block adapter for shared context.
+    Starts as identity (zero-init scale) and learns block-specific context shifts.
+    """
+    def __init__(self, filter_size):
+        super().__init__()
+        self.ln = nn.LayerNorm(filter_size)
+        self.mlp = nn.Sequential(
+            nn.Linear(filter_size, filter_size * 4),
+            nn.ReLU(inplace=True),
+            nn.Linear(filter_size * 4, filter_size),
+        )
+        self.scale = nn.Parameter(torch.zeros(1))
+
+    def forward(self, context):
+        if context is None:
+            return None
+        kv = context.get("kv", None)
+        if kv is None:
+            return context
+
+        delta = self.mlp(self.ln(kv))
+        kv_adapted = kv + self.scale.to(dtype=delta.dtype) * delta
+
+        out = dict(context)
+        out["kv"] = kv_adapted
+        return out
+
 # ------------------------- Affine Coupling -------------------------
 class AffineCoupling(nn.Module):
     """
     Affine Coupling layer for normalizing flow.
-    Uses shared context from ContextEncoder (computed once per block).
+    Uses shared context from ContextEncoder (computed once per Glow pass),
+    optionally adapted per block before entering the flow.
     """
     def __init__(self, in_channel, condition_dim, filter_size=256, affine=True):
         super().__init__()
@@ -2153,24 +2184,6 @@ class Block(nn.Module):
             self.prior = ZeroConv2d(in_channel, in_channel * 2)  # half channels after split
         else:
             self.prior = ZeroConv2d(in_channel * 2, in_channel * 4)  # no split, full channels
-        shared_filter = self.flows[0].coupling.filter_size
-        self.context_encoder = ContextEncoder(
-            filter_size=shared_filter,
-            num_heads=8,
-            history_input_dim=5,
-            topk_lanes=topk_lanes,
-            lane_selection_mode=lane_selection_mode,
-            hybrid_global_lanes=hybrid_global_lanes,
-            max_points=max_points,
-            map_input_dim=map_input_dim,
-            traffic_light_input_dim=traffic_light_input_dim,
-            num_lane_types=num_lane_types,
-            num_traffic_light_states=num_traffic_light_states,
-            lane_type_encoding=lane_type_encoding,
-            lane_type_embed_dim=lane_type_embed_dim,
-            lane_tl_embed_dim=lane_tl_embed_dim,
-            tl_state_embed_dim=tl_state_embed_dim,
-        )
 
     def _squeeze_time2(self, input):
         b_size, n_channel, height, width = input.shape
@@ -2201,6 +2214,7 @@ class Block(nn.Module):
         target_vehicle_mask=None,
         history_vehicle_mask=None,
         timestep_mask=None,
+        context=None,
     ):
         """
         Args:
@@ -2220,16 +2234,8 @@ class Block(nn.Module):
             # squeezed_mask 目前是 [B, 2, T/2, V]，需要扩展到 [B, 2*n_channel, T/2, V]
             squeezed_mask = squeezed_mask.repeat(1, n_channel, 1, 1)  # [B, 2C, T/2, V]
 
-        context = self.context_encoder(
-            condition=condition, agent_types=agent_types, agent_shape=agent_shape,
-            map_data=map_data, map_mask=map_mask,
-            traffic_light_data=traffic_light_data, traffic_light_mask=traffic_light_mask,
-            history_data=history_data,
-            history_timestep_mask=history_timestep_mask,
-            target_vehicle_mask=target_vehicle_mask,
-            history_vehicle_mask=history_vehicle_mask,
-            B_hint=b_size, V_hint=width
-        )
+        if context is None:
+            raise RuntimeError("Block.forward requires precomputed context from Glow.")
 
         logdet = torch.zeros(b_size, device=out.device)
         for flow in self.flows:
@@ -2271,6 +2277,7 @@ class Block(nn.Module):
         target_vehicle_mask=None,
         history_vehicle_mask=None,
         timestep_mask=None,
+        context=None,
     ):
         """
         Reverse pass for sampling.
@@ -2296,26 +2303,8 @@ class Block(nn.Module):
                 z = gaussian_sample(eps, mean, log_sd)
                 input = z
 
-        # same exogenous context for sampling
-        # context = self.context_encoder(
-        #     condition=condition, agent_types=agent_types,
-        #     map_data=map_data, map_mask=map_mask,
-        #     history_data=history_data,
-        #     target_vehicle_mask=target_vehicle_mask,
-        #     history_vehicle_mask=history_vehicle_mask
-        # )
-        b_size, _, _, width = input.shape  # input 此时已是 squeeze 域
-
-        context = self.context_encoder(
-            condition=condition, agent_types=agent_types, agent_shape=agent_shape,
-            map_data=map_data, map_mask=map_mask,
-            traffic_light_data=traffic_light_data, traffic_light_mask=traffic_light_mask,
-            history_data=history_data,
-            history_timestep_mask=history_timestep_mask,
-            target_vehicle_mask=target_vehicle_mask,
-            history_vehicle_mask=history_vehicle_mask,
-            B_hint=b_size, V_hint=width                 # <- NEW
-        )
+        if context is None:
+            raise RuntimeError("Block.reverse requires precomputed context from Glow.")
 
         # Prepare squeezed timestep_mask for flow.reverse if needed
         # Note: Flow.reverse currently doesn't use timestep_mask for computation,
@@ -2362,36 +2351,14 @@ class Glow(nn.Module):
         super().__init__()
         self.blocks = nn.ModuleList()
         n_channel = in_channel
+        shared_filter = None
         for i in range(n_block - 1):
-            self.blocks.append(
-                Block(
-                    n_channel,
-                    condition_dim,
-                    n_flow,
-                    affine=affine,
-                    conv_lu=conv_lu,
-                    max_points=max_points,
-                    map_input_dim=map_input_dim,
-                    traffic_light_input_dim=traffic_light_input_dim,
-                    num_lane_types=num_lane_types,
-                    num_traffic_light_states=num_traffic_light_states,
-                    lane_type_encoding=lane_type_encoding,
-                    lane_type_embed_dim=lane_type_embed_dim,
-                    lane_tl_embed_dim=lane_tl_embed_dim,
-                    tl_state_embed_dim=tl_state_embed_dim,
-                    lane_selection_mode=lane_selection_mode,
-                    topk_lanes=topk_lanes,
-                    hybrid_global_lanes=hybrid_global_lanes,
-                )
-            )
-            # n_channel *= 2
-        self.blocks.append(
-            Block(
+            block = Block(
                 n_channel,
                 condition_dim,
                 n_flow,
-                split=False,
                 affine=affine,
+                conv_lu=conv_lu,
                 max_points=max_points,
                 map_input_dim=map_input_dim,
                 traffic_light_input_dim=traffic_light_input_dim,
@@ -2405,6 +2372,54 @@ class Glow(nn.Module):
                 topk_lanes=topk_lanes,
                 hybrid_global_lanes=hybrid_global_lanes,
             )
+            self.blocks.append(block)
+            if shared_filter is None:
+                shared_filter = block.flows[0].coupling.filter_size
+            # n_channel *= 2
+        final_block = Block(
+            n_channel,
+            condition_dim,
+            n_flow,
+            split=False,
+            affine=affine,
+            max_points=max_points,
+            map_input_dim=map_input_dim,
+            traffic_light_input_dim=traffic_light_input_dim,
+            num_lane_types=num_lane_types,
+            num_traffic_light_states=num_traffic_light_states,
+            lane_type_encoding=lane_type_encoding,
+            lane_type_embed_dim=lane_type_embed_dim,
+            lane_tl_embed_dim=lane_tl_embed_dim,
+            tl_state_embed_dim=tl_state_embed_dim,
+            lane_selection_mode=lane_selection_mode,
+            topk_lanes=topk_lanes,
+            hybrid_global_lanes=hybrid_global_lanes,
+        )
+        self.blocks.append(final_block)
+        if shared_filter is None:
+            shared_filter = final_block.flows[0].coupling.filter_size
+
+        # Shared context encoder for all blocks: compute once per Glow forward/reverse.
+        self.context_encoder = ContextEncoder(
+            filter_size=shared_filter,
+            num_heads=8,
+            history_input_dim=5,
+            topk_lanes=topk_lanes,
+            lane_selection_mode=lane_selection_mode,
+            hybrid_global_lanes=hybrid_global_lanes,
+            max_points=max_points,
+            map_input_dim=map_input_dim,
+            traffic_light_input_dim=traffic_light_input_dim,
+            num_lane_types=num_lane_types,
+            num_traffic_light_states=num_traffic_light_states,
+            lane_type_encoding=lane_type_encoding,
+            lane_type_embed_dim=lane_type_embed_dim,
+            lane_tl_embed_dim=lane_tl_embed_dim,
+            tl_state_embed_dim=tl_state_embed_dim,
+        )
+        # Per-block lightweight adapters (zero-init => identity at start).
+        self.block_context_adapters = nn.ModuleList(
+            [BlockContextAdapter(shared_filter) for _ in range(len(self.blocks))]
         )
 
     def forward(
@@ -2438,14 +2453,31 @@ class Glow(nn.Module):
         # Auto-generate timestep_mask if not provided
         if timestep_mask is None:
             timestep_mask = create_timestep_mask(input, padding_value=-1.0)
+
+        context = self.context_encoder(
+            condition=condition,
+            agent_types=agent_types,
+            agent_shape=agent_shape,
+            map_data=map_data,
+            map_mask=map_mask,
+            traffic_light_data=traffic_light_data,
+            traffic_light_mask=traffic_light_mask,
+            history_data=history_data,
+            history_timestep_mask=history_timestep_mask,
+            target_vehicle_mask=target_vehicle_mask,
+            history_vehicle_mask=history_vehicle_mask,
+            B_hint=input.shape[0],
+            V_hint=input.shape[3],
+        )
         
         current_mask = timestep_mask  # [B, T, V]
         
-        for block in self.blocks:
+        for block_idx, block in enumerate(self.blocks):
+            block_context = self.block_context_adapters[block_idx](context)
             out, det, log_p, z_new = block(
                 out, condition, map_data, map_mask, traffic_light_data, traffic_light_mask,
                 agent_types, agent_shape, history_data, history_timestep_mask,
-                target_vehicle_mask, history_vehicle_mask, timestep_mask=current_mask
+                target_vehicle_mask, history_vehicle_mask, timestep_mask=current_mask, context=block_context
             )
             z_outs.append(z_new)
             logdet = logdet + det
@@ -2500,14 +2532,31 @@ class Glow(nn.Module):
                     # Downsample: [B, T, V] -> [B, T/2, V]
                     current_mask = current_mask.view(B_m, T_m // 2, 2, V_m).any(dim=2)
                 # 如果 T < 2，保持原样
+
+        context = self.context_encoder(
+            condition=condition,
+            agent_types=agent_types,
+            agent_shape=agent_shape,
+            map_data=map_data,
+            map_mask=map_mask,
+            traffic_light_data=traffic_light_data,
+            traffic_light_mask=traffic_light_mask,
+            history_data=history_data,
+            history_timestep_mask=history_timestep_mask,
+            target_vehicle_mask=target_vehicle_mask,
+            history_vehicle_mask=history_vehicle_mask,
+            B_hint=z_list[-1].shape[0],
+            V_hint=z_list[-1].shape[3],
+        )
         
         for i, block in enumerate(self.blocks[::-1]):
+            block_idx = n_block - 1 - i
+            block_context = self.block_context_adapters[block_idx](context)
             # 获取当前 block 对应的 mask（reverse 顺序：最后一个 block 用最小分辨率的 mask）
             block_mask = None
             if timestep_mask is not None and len(mask_list) > 0:
                 # blocks[::-1] 的第 i 个对应原始的第 (n_block - 1 - i) 个
                 # 但 mask_list 是按 forward 顺序存的，所以取 mask_list[n_block - 1 - i]
-                block_idx = n_block - 1 - i
                 block_mask = mask_list[block_idx]
             
             if i == 0:
@@ -2527,6 +2576,7 @@ class Glow(nn.Module):
                     target_vehicle_mask=target_vehicle_mask,
                     history_vehicle_mask=history_vehicle_mask,
                     timestep_mask=block_mask,
+                    context=block_context,
                 )
             else:
                 input = block.reverse(
@@ -2545,5 +2595,6 @@ class Glow(nn.Module):
                     target_vehicle_mask=target_vehicle_mask,
                     history_vehicle_mask=history_vehicle_mask,
                     timestep_mask=block_mask,
+                    context=block_context,
                 )
         return input
