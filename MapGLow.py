@@ -1330,6 +1330,7 @@ class ContextEncoder(nn.Module):
     Builds context strictly from exogenous inputs:
       - map lane features (shared across all agents)
       - history features
+      - anchor-state token from last valid history timestep (NEW)
       - label / agent-type embeddings
       - agent shape embeddings (length/width/height)
       - agent interaction features (NEW)
@@ -1393,6 +1394,13 @@ class ContextEncoder(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(filter_size // 2, filter_size),
         )
+        # Rich anchor token from last valid history state:
+        # [x, y, vx, vy, speed, cos(yaw), sin(yaw), dist, vel_dir_x, vel_dir_y, valid]
+        self.agent_anchor_proj = nn.Sequential(
+            nn.Linear(11, filter_size // 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(filter_size // 2, filter_size),
+        )
         self.history_map_cross_attn = HistoryMapCrossAttention(filter_size=filter_size, num_heads=num_heads)
         
         # 新增：Agent交互模块
@@ -1409,14 +1417,16 @@ class ContextEncoder(nn.Module):
             device = agent_valid_mask.device
             anchor = torch.zeros(B, V, 2, device=device, dtype=torch.float32)
             anchor_vel = torch.zeros(B, V, 2, device=device, dtype=torch.float32)
+            anchor_yaw = torch.zeros(B, V, 1, device=device, dtype=torch.float32)
             # Default to all valid if history is missing, assuming agents are at (0,0) or relevant
             anchor_valid = agent_valid_mask.clone()
-            return anchor, anchor_vel, anchor_valid
+            return anchor, anchor_vel, anchor_yaw, anchor_valid
 
         device = history_data.device
         dtype = history_data.dtype
         anchor = torch.zeros(B, V, 2, device=device, dtype=dtype)
         anchor_vel = torch.zeros(B, V, 2, device=device, dtype=dtype)
+        anchor_yaw = torch.zeros(B, V, 1, device=device, dtype=dtype)
         anchor_valid = torch.zeros(B, V, dtype=torch.bool, device=device)
 
         if history_timestep_mask is None:
@@ -1440,8 +1450,13 @@ class ContextEncoder(nn.Module):
             vel_flat = vel.reshape(B * V, history_data.shape[2], 2)
             gathered_vel = torch.gather(vel_flat, 1, gather_idx).squeeze(1).view(B, V, 2)
             anchor_vel = torch.where(has_valid.unsqueeze(-1), gathered_vel, anchor_vel)
+        if history_data.shape[1] >= 5:
+            yaw = history_data[:, 4:5, :, :].permute(0, 3, 2, 1)  # [B, V, T_hist, 1]
+            yaw_flat = yaw.reshape(B * V, history_data.shape[2], 1)
+            gathered_yaw = torch.gather(yaw_flat, 1, gather_idx[..., :1]).squeeze(1).view(B, V, 1)
+            anchor_yaw = torch.where(has_valid.unsqueeze(-1), gathered_yaw, anchor_yaw)
         anchor_valid = has_valid & agent_valid_mask
-        return anchor, anchor_vel, anchor_valid
+        return anchor, anchor_vel, anchor_yaw, anchor_valid
 
     def _lane_type_per_lane(self, map_data, map_mask):
         """
@@ -1752,7 +1767,7 @@ class ContextEncoder(nn.Module):
         else:
             agent_valid_mask = torch.ones(B, V, dtype=torch.bool, device=device)
 
-        agent_anchor_xy, agent_anchor_vel, agent_anchor_valid = self._extract_agent_anchor(
+        agent_anchor_xy, agent_anchor_vel, agent_anchor_yaw, agent_anchor_valid = self._extract_agent_anchor(
             history_data, history_timestep_mask, history_vehicle_mask, agent_valid_mask
         )
 
@@ -1896,6 +1911,35 @@ class ContextEncoder(nn.Module):
             agent_invalid_mask = (~agent_valid_mask).reshape(B * V, 1)
             kv_list.append(shape_emb)
             mask_list.append(agent_invalid_mask)
+
+        # Add rich anchor-state token so target branch can recover absolute geometry more directly.
+        # This is especially helpful when target trajectory is represented as deltas.
+        speed = torch.norm(agent_anchor_vel, dim=-1, keepdim=True)  # [B,V,1]
+        dist = torch.norm(agent_anchor_xy, dim=-1, keepdim=True)    # [B,V,1]
+        cos_yaw = torch.cos(agent_anchor_yaw)
+        sin_yaw = torch.sin(agent_anchor_yaw)
+        vel_dir = agent_anchor_vel / (speed + 1e-6)  # [B,V,2]
+        stationary = (speed < 0.05).to(dtype=agent_anchor_xy.dtype)  # normalized-speed threshold
+        anchor_valid_f = agent_anchor_valid.unsqueeze(-1).to(dtype=agent_anchor_xy.dtype)
+        anchor_feat = torch.cat(
+            [
+                agent_anchor_xy,      # x, y
+                agent_anchor_vel,     # vx, vy
+                speed,                # speed
+                cos_yaw, sin_yaw,     # heading unit vector
+                dist,                 # radial distance to local origin
+                vel_dir,              # velocity direction unit vector
+                anchor_valid_f,       # validity bit
+            ],
+            dim=-1,
+        )  # [B,V,11]
+        anchor_feat = torch.nan_to_num(anchor_feat, nan=0.0, posinf=0.0, neginf=0.0)
+        anchor_emb = self.agent_anchor_proj(anchor_feat.to(device=device, dtype=torch.float32)).to(dtype)
+        anchor_emb = anchor_emb.reshape(B * V, 1, self.filter_size)
+        anchor_invalid_mask = (~agent_anchor_valid).reshape(B * V, 1)
+        kv_list.append(anchor_emb)
+        mask_list.append(anchor_invalid_mask)
+
         if history_tokens is not None:
             kv_list.append(history_tokens)  # [B*V, T_hist, F]
             mask_list.append(history_token_mask)  # [B*V, T_hist]

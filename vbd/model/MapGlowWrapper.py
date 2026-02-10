@@ -69,6 +69,13 @@ class MapGlowWrapper(pl.LightningModule):
         self._lane_selection_mode = str(cfg.get('lane_selection_mode', 'hybrid')).lower()
         self._topk_lanes = int(cfg.get('topk_lanes', 16))
         self._hybrid_global_lanes = int(cfg.get('hybrid_global_lanes', 16))
+        self._trajectory_mode = str(cfg.get('trajectory_mode', 'absolute')).lower()
+        if self._trajectory_mode not in ('absolute', 'delta'):
+            self._trajectory_mode = 'absolute'
+        self._use_delta_trajectory = self._trajectory_mode == 'delta'
+        self._delta_pos_scale = float(cfg.get('delta_pos_scale', 1.0))
+        if self._delta_pos_scale <= 0:
+            self._delta_pos_scale = 1.0
 
         map_input_dim = 5 if self._lane_type_encoding == 'embedding' else (4 + self._num_lane_types)
         traffic_light_input_dim = 3  # [x, y, tl_state_idx]
@@ -98,11 +105,151 @@ class MapGlowWrapper(pl.LightningModule):
         # Normalization parameters for trajectory data
         # Position normalized by 100 meters
         self.register_buffer('pos_scale', torch.tensor(100.0))  # position scale (meters)
+        self.register_buffer('delta_pos_scale', torch.tensor(self._delta_pos_scale))  # delta x/y scale
         self.register_buffer('vel_scale', torch.tensor(10.0))   # velocity scale (m/s)
         self.register_buffer('yaw_scale', torch.tensor(1.0))    # yaw already in [-pi, pi]
         shape_scale_cfg = cfg.get('agent_shape_scale', [10.0, 5.0, 3.0])
         self.register_buffer('shape_scale', torch.tensor(shape_scale_cfg, dtype=torch.float32))
         self._warned_missing_sdc = False
+
+    def _xyyaw_from_state5(self, traj5):
+        """
+        Extract [x, y, yaw] from state channels [x, y, vx, vy, yaw].
+        """
+        return torch.stack([traj5[..., 0], traj5[..., 1], traj5[..., 4]], dim=-1)
+
+    def _extract_last_history_anchor(self, history_data, history_timestep_mask=None):
+        """
+        Extract per-agent anchor from last valid history timestep.
+        history_data: [B, C, T_hist, V], channel order [x, y, vx, vy, yaw]
+        history_timestep_mask: [B, T_hist, V] bool (optional)
+        Returns:
+            anchor_xyyaw: [B, 3, V] (x, y, yaw)
+            anchor_valid: [B, V] bool
+        """
+        B, C, T_hist, V = history_data.shape
+        device = history_data.device
+        dtype = history_data.dtype
+
+        if history_timestep_mask is None:
+            history_timestep_mask = create_timestep_mask(history_data, padding_value=0.0)
+        hist_mask = history_timestep_mask.bool()  # [B, T_hist, V]
+
+        anchor_valid = hist_mask.any(dim=1)  # [B, V]
+        time_idx = torch.arange(T_hist, device=device).view(1, T_hist, 1)
+        weighted = torch.where(hist_mask, time_idx, torch.full_like(time_idx, -1))
+        last_idx = weighted.max(dim=1).values.clamp(min=0).long()  # [B, V]
+
+        # Gather last valid [x, y, yaw]
+        traj_xyyaw = torch.stack(
+            [history_data[:, 0], history_data[:, 1], history_data[:, 4]], dim=1
+        )  # [B, 3, T_hist, V]
+        traj_flat = traj_xyyaw.permute(0, 3, 2, 1).reshape(B * V, T_hist, 3)  # [B*V, T_hist, 3]
+        gather_idx = last_idx.reshape(B * V, 1, 1).expand(-1, 1, 3)
+        anchor = torch.gather(traj_flat, 1, gather_idx).squeeze(1).reshape(B, V, 3)  # [B, V, 3]
+        anchor = torch.where(anchor_valid.unsqueeze(-1), anchor, torch.zeros_like(anchor))
+        anchor_xyyaw = anchor.permute(0, 2, 1).to(dtype=dtype)  # [B, 3, V]
+        return anchor_xyyaw, anchor_valid
+
+    def _absolute_to_delta_target(self, traj, timestep_mask=None, anchor_xyyaw=None, anchor_valid=None):
+        """
+        Convert absolute target trajectory to delta target.
+        Input/Output channel order: [x, y, vx, vy, yaw], only x/y/yaw become deltas.
+        traj: [B, C, T, V]
+        timestep_mask: [B, T, V], True = valid (optional)
+        """
+        if traj.size(2) == 0:
+            return traj
+
+        out = traj.clone()
+        x = traj[:, 0]
+        y = traj[:, 1]
+        vx = traj[:, 2]
+        vy = traj[:, 3]
+        yaw = traj[:, 4]
+
+        dx = torch.zeros_like(x)
+        dy = torch.zeros_like(y)
+        dyaw = torch.zeros_like(yaw)
+
+        if anchor_xyyaw is None:
+            dx[:, 0] = x[:, 0]
+            dy[:, 0] = y[:, 0]
+            dyaw[:, 0] = yaw[:, 0]
+        else:
+            anchor_x = anchor_xyyaw[:, 0]  # [B, V]
+            anchor_y = anchor_xyyaw[:, 1]
+            anchor_yaw = anchor_xyyaw[:, 2]
+            dx[:, 0] = x[:, 0] - anchor_x
+            dy[:, 0] = y[:, 0] - anchor_y
+            dyaw[:, 0] = wrap_angle(yaw[:, 0] - anchor_yaw)
+
+        if traj.size(2) > 1:
+            dx[:, 1:] = x[:, 1:] - x[:, :-1]
+            dy[:, 1:] = y[:, 1:] - y[:, :-1]
+            dyaw[:, 1:] = wrap_angle(yaw[:, 1:] - yaw[:, :-1])
+
+        if timestep_mask is not None:
+            valid0_bool = timestep_mask[:, 0, :]
+            if anchor_valid is not None:
+                valid0_bool = valid0_bool & anchor_valid.bool()
+            valid0 = valid0_bool.to(dtype=dx.dtype)
+            dx[:, 0] = dx[:, 0] * valid0
+            dy[:, 0] = dy[:, 0] * valid0
+            dyaw[:, 0] = dyaw[:, 0] * valid0
+            if traj.size(2) > 1:
+                pair_valid = (timestep_mask[:, 1:, :] & timestep_mask[:, :-1, :]).to(dtype=dx.dtype)
+                dx[:, 1:] = dx[:, 1:] * pair_valid
+                dy[:, 1:] = dy[:, 1:] * pair_valid
+                dyaw[:, 1:] = dyaw[:, 1:] * pair_valid
+
+        out[:, 0] = dx
+        out[:, 1] = dy
+        out[:, 2] = vx
+        out[:, 3] = vy
+        out[:, 4] = dyaw
+        out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+        return out
+
+    def _delta_to_absolute_target(self, traj, timestep_mask=None, anchor_xyyaw=None, anchor_valid=None):
+        """
+        Convert delta target back to absolute target.
+        Input/Output channel order: [x, y, vx, vy, yaw], where x/y/yaw are integrated from deltas.
+        traj: [B, C, T, V]
+        timestep_mask: [B, T, V], True = valid (optional)
+        """
+        if traj.size(2) == 0:
+            return traj
+
+        out = traj.clone()
+        dx = traj[:, 0]
+        dy = traj[:, 1]
+        vx = traj[:, 2]
+        vy = traj[:, 3]
+        dyaw = traj[:, 4]
+
+        x = torch.cumsum(dx, dim=1)
+        y = torch.cumsum(dy, dim=1)
+        yaw = wrap_angle(torch.cumsum(dyaw, dim=1))
+        if anchor_xyyaw is not None:
+            x = x + anchor_xyyaw[:, 0].unsqueeze(1)
+            y = y + anchor_xyyaw[:, 1].unsqueeze(1)
+            yaw = wrap_angle(yaw + anchor_xyyaw[:, 2].unsqueeze(1))
+
+        out[:, 0] = x
+        out[:, 1] = y
+        out[:, 2] = vx
+        out[:, 3] = vy
+        out[:, 4] = yaw
+
+        if timestep_mask is not None:
+            valid = timestep_mask.bool()
+            if anchor_valid is not None:
+                valid = valid & anchor_valid.bool().unsqueeze(1)
+            out = out * valid.unsqueeze(1).to(dtype=out.dtype)
+
+        out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+        return out
         
     def configure_optimizers(self):
         """
@@ -314,10 +461,26 @@ class MapGlowWrapper(pl.LightningModule):
             timestep_mask[no_valid_agents, :, 0] = True
             history_vehicle_mask[no_valid_agents, 0] = True
             history_timestep_mask[no_valid_agents, -1, 0] = True
+
+        target_anchor_xyyaw, target_anchor_valid = self._extract_last_history_anchor(
+            history_data, history_timestep_mask=history_timestep_mask
+        )
+
+        # Optional target representation switch:
+        # - absolute: [x, y, vx, vy, yaw] (default)
+        # - delta:    [dx, dy, vx, vy, dyaw]
+        # NOTE: history_data must stay absolute because ContextEncoder relies on real positions.
+        if self._use_delta_trajectory:
+            target_data = self._absolute_to_delta_target(
+                target_data,
+                timestep_mask=timestep_mask,
+                anchor_xyyaw=target_anchor_xyyaw,
+                anchor_valid=target_anchor_valid,
+            )
         
         # Normalize the trajectory data
-        history_data = self.normalize_trajectory(history_data)
-        target_data = self.normalize_trajectory(target_data)
+        history_data = self.normalize_trajectory(history_data, use_delta_xy=False)
+        target_data = self.normalize_trajectory(target_data, use_delta_xy=self._use_delta_trajectory)
         
         # Apply masks to zero out invalid data (important for numerical stability)
         # For completely invalid agents, replace with small non-zero values to avoid division by zero
@@ -341,6 +504,8 @@ class MapGlowWrapper(pl.LightningModule):
         # Prepare map data - transform to local frame
         polylines = batch['polylines']  # [B, L, P, 5] - x, y, heading, traffic_light, lane_type
         polylines_valid = batch['polylines_valid']  # [B, L]
+        polyline_ids = batch.get('polyline_ids', None)  # [B, L], optional roadgraph ids
+        lane_topology = batch.get('lane_topology', None)  # [B, L, L, 4], optional
         polyline_point_valid = batch.get('polylines_point_valid', None)
         if polyline_point_valid is None:
             polyline_point_valid = polylines[..., :2].abs().sum(-1) > self._valid_eps
@@ -433,6 +598,8 @@ class MapGlowWrapper(pl.LightningModule):
             'agent_shape': agent_shape,  # [B, V, 3] normalized [length,width,height]
             'map_data': map_data,  # [B, L, P, D]
             'map_mask': map_mask,  # [B, L, P]
+            'polyline_ids': polyline_ids,  # [B, L] optional
+            'lane_topology': lane_topology,  # [B, L, L, 4] optional
             'traffic_light_data': traffic_light_data,  # [B, TL, 3] = [x, y, tl_state_idx]
             'traffic_light_mask': traffic_light_mask,  # [B, TL]
             'agent_types': agents_type,  # [B, V]
@@ -440,6 +607,8 @@ class MapGlowWrapper(pl.LightningModule):
             'history_vehicle_mask': history_vehicle_mask,  # [B, V]
             'history_timestep_mask': history_timestep_mask,  # [B, T_hist, V]
             'timestep_mask': timestep_mask,  # [B, T, V]
+            'target_anchor_xyyaw': target_anchor_xyyaw,  # [B, 3, V], local current anchor
+            'target_anchor_valid': target_anchor_valid,  # [B, V]
             'condition': condition,  # [B, V, D] or None
             # Keep original data for loss computation and metrics
             'agents_future': agents_future,  # [B, A, T_fut, 5]
@@ -640,13 +809,15 @@ class MapGlowWrapper(pl.LightningModule):
         
         return local_future
     
-    def normalize_trajectory(self, traj):
+    def normalize_trajectory(self, traj, use_delta_xy=False):
         """
         Normalize trajectory data.
         traj: [B, C, T, V] where C = [x, y, vx, vy, yaw]
         """
         traj = traj.clone()
-        traj[:, 0:2] = traj[:, 0:2] / self.pos_scale  # x, y
+        # use_delta_xy=True means channels 0:2 are [dx, dy], otherwise [x, y].
+        pos_scale = self.delta_pos_scale if use_delta_xy else self.pos_scale
+        traj[:, 0:2] = traj[:, 0:2] / pos_scale
         traj[:, 2:4] = traj[:, 2:4] / self.vel_scale  # vx, vy
         traj[:, 4:5] = traj[:, 4:5] / self.yaw_scale  # yaw
         
@@ -657,13 +828,14 @@ class MapGlowWrapper(pl.LightningModule):
         
         return traj
     
-    def unnormalize_trajectory(self, traj):
+    def unnormalize_trajectory(self, traj, use_delta_xy=False):
         """
         Unnormalize trajectory data.
         traj: [B, C, T, V] where C = [x, y, vx, vy, yaw]
         """
         traj = traj.clone()
-        traj[:, 0:2] = traj[:, 0:2] * self.pos_scale
+        pos_scale = self.delta_pos_scale if use_delta_xy else self.pos_scale
+        traj[:, 0:2] = traj[:, 0:2] * pos_scale
         traj[:, 2:4] = traj[:, 2:4] * self.vel_scale
         traj[:, 4:5] = traj[:, 4:5] * self.yaw_scale
         return traj
@@ -880,7 +1052,7 @@ class MapGlowWrapper(pl.LightningModule):
                 
                 # Get ground truth in local frame
                 gt_local = inputs['agents_future_local'][:, :, 1:, :3]  # [B, A, T, 3]
-                pred_local = sampled_trajs[..., :3]  # [B, A, T, 3]
+                pred_local = self._xyyaw_from_state5(sampled_trajs)  # [B, A, T, 3]
                 future_valid = agents_future_valid[:, :, 1:]
                 
                 # Compute trajectory metrics
@@ -951,7 +1123,14 @@ class MapGlowWrapper(pl.LightningModule):
         )
         
         # Unnormalize: [B, C, T, V] -> [B, V, T, C] -> [B, A, T, 5]
-        sample = self.unnormalize_trajectory(sample)
+        sample = self.unnormalize_trajectory(sample, use_delta_xy=self._use_delta_trajectory)
+        if self._use_delta_trajectory:
+            sample = self._delta_to_absolute_target(
+                sample,
+                timestep_mask=inputs['timestep_mask'],
+                anchor_xyyaw=inputs.get('target_anchor_xyyaw', None),
+                anchor_valid=inputs.get('target_anchor_valid', None),
+            )
         sample = sample.permute(0, 3, 2, 1)  # [B, A, T, 5]
 
         # Mask invalid agents/timesteps to avoid leaking unconstrained predictions.
@@ -1069,7 +1248,14 @@ class MapGlowWrapper(pl.LightningModule):
             )
             
             # Unnormalize: [B, C, T, V]
-            sample = self.unnormalize_trajectory(sample)
+            sample = self.unnormalize_trajectory(sample, use_delta_xy=self._use_delta_trajectory)
+            if self._use_delta_trajectory:
+                sample = self._delta_to_absolute_target(
+                    sample,
+                    timestep_mask=inputs['timestep_mask'],
+                    anchor_xyyaw=inputs.get('target_anchor_xyyaw', None),
+                    anchor_valid=inputs.get('target_anchor_valid', None),
+                )
             
             # Convert to [B, A, T, 5] format
             sample = sample.permute(0, 3, 2, 1)  # [B, A, T, 5]
@@ -1083,11 +1269,11 @@ class MapGlowWrapper(pl.LightningModule):
             if return_global:
                 # Transform back to global frame
                 current_states = inputs['current_states']  # [B, A, 3]
-                sample_global = self._transform_local_to_global(sample[..., :3], current_states)
+                sample_global = self._transform_local_to_global(self._xyyaw_from_state5(sample), current_states)
                 sample_global = sample_global.masked_fill(~pred_valid.unsqueeze(-1), 0.0)
                 all_samples.append(sample_global)
             else:
-                all_samples.append(sample[..., :3])
+                all_samples.append(self._xyyaw_from_state5(sample))
         
         # Stack samples: [B, n_samples, A, T, 3]
         samples = torch.stack(all_samples, dim=1)
@@ -1174,12 +1360,19 @@ class MapGlowWrapper(pl.LightningModule):
             timestep_mask=inputs['timestep_mask']
         )
         
-        reconstructed = self.unnormalize_trajectory(reconstructed)
+        reconstructed = self.unnormalize_trajectory(reconstructed, use_delta_xy=self._use_delta_trajectory)
+        if self._use_delta_trajectory:
+            reconstructed = self._delta_to_absolute_target(
+                reconstructed,
+                timestep_mask=inputs['timestep_mask'],
+                anchor_xyyaw=inputs.get('target_anchor_xyyaw', None),
+                anchor_valid=inputs.get('target_anchor_valid', None),
+            )
         reconstructed = reconstructed.permute(0, 3, 2, 1)  # [B, A, T, 5]
         
         original = inputs['agents_future_local'][:, :, 1:, :3]
         
-        return reconstructed[..., :3], original
+        return self._xyyaw_from_state5(reconstructed), original
     
     @torch.no_grad()
     def compute_nll(self, batch):

@@ -1175,6 +1175,10 @@ def build_parser():
                         help="Number of blocks")
     parser.add_argument("--condition_dim", type=int, default=None,
                         help="Condition dimension")
+    parser.add_argument("--trajectory_mode", type=str, default=None,
+                        help="Trajectory representation: absolute or delta")
+    parser.add_argument("--delta_pos_scale", type=float, default=None,
+                        help="dx/dy normalization scale used only in delta mode")
     parser.add_argument("--affine", action="store_true",
                         help="Use affine coupling")
     parser.add_argument("--temperature", type=float, default=None,

@@ -176,6 +176,106 @@ def calculate_relations(agents, polylines, traffic_lights):
 
     return relations
 
+
+def _wrap_angle_np(angle):
+    return (angle + np.pi) % (2 * np.pi) - np.pi
+
+
+def build_lane_topology(
+    polylines: np.ndarray,
+    polyline_ids: np.ndarray,
+    valid_mask: np.ndarray = None,
+    succ_dist_thresh: float = 8.0,
+    succ_yaw_thresh: float = 0.8,
+    neigh_long_thresh: float = 20.0,
+    neigh_lat_min: float = 1.2,
+    neigh_lat_max: float = 12.0,
+    neigh_yaw_thresh: float = 0.6,
+):
+    """
+    Build approximate lane topology from sampled polylines.
+
+    Topology channels:
+      0: successor (i -> j)
+      1: predecessor (i <- j)
+      2: left neighbor
+      3: right neighbor
+
+    Args:
+        polylines: [L, P, 5], feature = [x, y, heading, tl_state, lane_type]
+        polyline_ids: [L], original roadgraph id per polyline (-1 for padding)
+        valid_mask: [L] optional lane-level validity
+    Returns:
+        lane_topology: [L, L, 4] int32
+    """
+    L = int(polylines.shape[0])
+    topo = np.zeros((L, L, 4), dtype=np.int32)
+    if L == 0:
+        return topo
+
+    if valid_mask is None:
+        valid_mask = (polyline_ids >= 0)
+    valid_idx = np.where(valid_mask)[0]
+    if valid_idx.size == 0:
+        return topo
+
+    xy = polylines[..., :2]
+    heading = polylines[..., 2]
+    p_mid = polylines.shape[1] // 2
+    start_xy = xy[:, 0]
+    end_xy = xy[:, -1]
+    start_h = heading[:, 0]
+    end_h = heading[:, -1]
+    mid_xy = xy[:, p_mid]
+    mid_h = heading[:, p_mid]
+
+    # Successor / predecessor
+    for i in valid_idx:
+        for j in valid_idx:
+            if i == j:
+                continue
+            d = np.linalg.norm(end_xy[i] - start_xy[j])
+            if d > succ_dist_thresh:
+                continue
+            dyaw = np.abs(_wrap_angle_np(end_h[i] - start_h[j]))
+            if dyaw <= succ_yaw_thresh:
+                topo[i, j, 0] = 1
+
+    topo[:, :, 1] = topo[:, :, 0].T  # predecessor
+
+    # Left / right neighbors: choose nearest valid lateral candidate for each lane.
+    for i in valid_idx:
+        ci = np.cos(mid_h[i])
+        si = np.sin(mid_h[i])
+        best_left = (-1, np.inf)   # (j, |lat|)
+        best_right = (-1, np.inf)  # (j, |lat|)
+
+        for j in valid_idx:
+            if i == j:
+                continue
+            dxy = mid_xy[j] - mid_xy[i]
+            lon = dxy[0] * ci + dxy[1] * si
+            lat = -dxy[0] * si + dxy[1] * ci
+            if np.abs(lon) > neigh_long_thresh:
+                continue
+            alat = np.abs(lat)
+            if alat < neigh_lat_min or alat > neigh_lat_max:
+                continue
+            dyaw = np.abs(_wrap_angle_np(mid_h[i] - mid_h[j]))
+            if dyaw > neigh_yaw_thresh:
+                continue
+            if lat > 0 and alat < best_left[1]:
+                best_left = (j, alat)
+            if lat < 0 and alat < best_right[1]:
+                best_right = (j, alat)
+
+        if best_left[0] >= 0:
+            topo[i, best_left[0], 2] = 1
+        if best_right[0] >= 0:
+            topo[i, best_right[0], 3] = 1
+
+    return topo
+
 def tf_preprocess(serialized: bytes) -> dict[str, tf.Tensor]:
     """
     Preprocesses the serialized data.
@@ -405,6 +505,7 @@ def data_process_scenario(
     ############### get roadgraph points near agents ###############
     map_ids = []
     current_valid = agents_interested > 0
+    nearby_roadgraph_points = None
     
     for a in range(agents_history.shape[0]):
         if not current_valid[a]:
@@ -412,6 +513,17 @@ def data_process_scenario(
         
         agent_position = agents_history[a, -1, :2]
         nearby_roadgraph_points = filter_topk_roadgraph_points(roadgraph_points, agent_position, 3000)
+        map_ids.append(nearby_roadgraph_points.ids.tolist())
+
+    # Fallback if no interested agent is valid at current index.
+    if len(map_ids) == 0:
+        fallback_xy = np.array([0.0, 0.0], dtype=np.float32)
+        if agents_history.shape[0] > 0:
+            hist_last = agents_history[:, -1, :2]
+            non_zero = np.where(np.linalg.norm(hist_last, axis=-1) > 1e-6)[0]
+            if len(non_zero) > 0:
+                fallback_xy = hist_last[non_zero[0]]
+        nearby_roadgraph_points = filter_topk_roadgraph_points(roadgraph_points, fallback_xy, 3000)
         map_ids.append(nearby_roadgraph_points.ids.tolist())
 
     # sort map ids
@@ -425,6 +537,7 @@ def data_process_scenario(
     # polyline feature: x, y, heading, traffic_light, type
     polylines = []
     polylines_point_valid = []
+    polyline_ids = []
     
     roadgraph_points_x = np.asarray(roadgraph_points.x)
     roadgraph_points_y = np.asarray(roadgraph_points.y)
@@ -450,27 +563,44 @@ def data_process_scenario(
         cur_polyline = np.take(polyline, sampled_points, axis=0)
         polylines.append(cur_polyline)
         polylines_point_valid.append(np.ones((num_points_polyline,), dtype=np.int32))
+        polyline_ids.append(int(id))
     
     # post processing polylines
     if len(polylines) > 0:
         polylines = np.stack(polylines, axis=0)
         polylines_point_valid = np.stack(polylines_point_valid, axis=0)
         polylines_valid = np.ones((polylines.shape[0],), dtype=np.int32)
+        polyline_ids = np.asarray(polyline_ids, dtype=np.int32)
     else:
         polylines = np.zeros((1, num_points_polyline, 5), dtype=np.float32)
         polylines_point_valid = np.zeros((1, num_points_polyline), dtype=np.int32)
         polylines_valid = np.zeros((1,), dtype=np.int32)
+        polyline_ids = -np.ones((1,), dtype=np.int32)
+
+    # Build topology before padding/truncation.
+    lane_topology = build_lane_topology(
+        polylines,
+        polyline_ids,
+        valid_mask=(polylines_valid > 0),
+    )
     
     if polylines.shape[0] >= max_polylines:
         polylines = polylines[:max_polylines]
         polylines_point_valid = polylines_point_valid[:max_polylines]
         polylines_valid = polylines_valid[:max_polylines]
+        polyline_ids = polyline_ids[:max_polylines]
+        lane_topology = lane_topology[:max_polylines, :max_polylines]
     else:
+        n_cur = polylines.shape[0]
         polylines = np.pad(polylines, ((0, max_polylines-polylines.shape[0]), (0, 0), (0, 0)))
         polylines_point_valid = np.pad(
             polylines_point_valid, ((0, max_polylines-polylines_point_valid.shape[0]), (0, 0))
         )
         polylines_valid = np.pad(polylines_valid, (0, max_polylines-polylines_valid.shape[0]))
+        polyline_ids = np.pad(polyline_ids, (0, max_polylines - n_cur), constant_values=-1)
+        lane_topology_padded = np.zeros((max_polylines, max_polylines, lane_topology.shape[-1]), dtype=np.int32)
+        lane_topology_padded[:n_cur, :n_cur] = lane_topology
+        lane_topology = lane_topology_padded
 
     relations = calculate_relations(agents_history, polylines, traffic_light_points)
     relations = np.asarray(relations)
@@ -487,6 +617,8 @@ def data_process_scenario(
         'polylines': np.float32(polylines),
         'polylines_point_valid': np.int32(polylines_point_valid),
         'polylines_valid': np.int32(polylines_valid),
+        'polyline_ids': np.int32(polyline_ids),
+        'lane_topology': np.int32(lane_topology),  # [L, L, 4] = succ/pred/left/right
         'relations': np.float32(relations),
         'agents_id': np.int32(agents_id),
         'sdc_id': np.int32(sdc_id),

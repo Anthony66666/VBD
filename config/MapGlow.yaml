@@ -30,9 +30,11 @@ history_len: 11     # History trajectory length (timesteps)
 
 # MapGlow Model Config
 in_channel: 5         # Input channels: x, y, vx, vy, yaw
+trajectory_mode: delta   # absolute / delta (delta => [dx, dy, vx, vy, dyaw] for target only)
+delta_pos_scale: 1.0  # used only in delta mode for dx/dy normalization
 condition_dim: 256    # Condition embedding dimension (match encoder output)
-n_flow: 16             # Number of flows per block (reduced from 16 for stability)
-n_block: 3            # Number of blocks (reduced from 3 for initial training)
+n_flow: 8             # Number of flows per block (reduced from 16 for stability)
+n_block: 2            # Number of blocks (reduced from 3 for initial training)
 affine: True          # Use affine coupling (True) or additive (False)
 conv_lu: True         # Use LU decomposition for 1x1 conv
 temperature: 0.7      # Sampling temperature
@@ -53,11 +55,11 @@ agent_shape_scale: [10.0, 5.0, 3.0]  # normalize [length, width, height]
 seed: 42
 batch_size: 4
 num_workers: 0
-lr: 0.0001           # Reduced learning rate for normalizing flow stability
+lr: 0.0002           # Reduced learning rate for normalizing flow stability
 weight_decay: 0.000001  # Reduced weight decay
 epochs: 100
 lr_warmup_step: 2000  # Longer warmup
-lr_step_freq: 1000
+lr_step_freq: 10000
 lr_step_gamma: 0.98
 gradient_clip_val: 1  # Stricter gradient clipping
 

@@ -96,6 +96,8 @@ class WaymaxDataset(Dataset):
         traffic_light_points = data['traffic_light_points']
         polylines = data['polylines']
         polylines_valid = data['polylines_valid']
+        polyline_ids = data.get('polyline_ids', None)
+        lane_topology = data.get('lane_topology', None)
         agents_history_valid = data.get('agents_history_valid', None)
         agents_future_valid = data.get('agents_future_valid', None)
         traffic_light_valid = data.get('traffic_light_valid', None)
@@ -122,6 +124,10 @@ class WaymaxDataset(Dataset):
             "relations": torch.from_numpy(relations),
             "anchors": torch.from_numpy(anchors)
         }
+        if polyline_ids is not None:
+            tensors["polyline_ids"] = torch.from_numpy(polyline_ids)
+        if lane_topology is not None:
+            tensors["lane_topology"] = torch.from_numpy(lane_topology)
         if agents_history_valid is not None:
             tensors["agents_history_valid"] = torch.from_numpy(agents_history_valid)
         if agents_future_valid is not None:
