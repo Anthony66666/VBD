@@ -1354,6 +1354,7 @@ class ContextEncoder(nn.Module):
         lane_type_embed_dim=16,
         lane_tl_embed_dim=8,
         tl_state_embed_dim=8,
+        use_lane_topology=True,
     ):
         super().__init__()
         self.filter_size = filter_size
@@ -1364,6 +1365,7 @@ class ContextEncoder(nn.Module):
         self.hybrid_global_lanes = int(hybrid_global_lanes)
         self.lane_type_encoding = str(lane_type_encoding).lower()
         self.num_lane_types = int(num_lane_types)
+        self.use_lane_topology = bool(use_lane_topology)
         self.history_extractor = UnifiedSpatioTemporalExtractor(
             input_dim=history_input_dim, filter_size=filter_size,
             num_heads=num_heads, num_layers=1, max_seq_len=30, causal=True
@@ -1408,7 +1410,58 @@ class ContextEncoder(nn.Module):
         
         # 新增：Lane-aware attention
         self.lane_aware_attn = LaneAwareAttention(filter_size=filter_size, num_heads=num_heads)
-        
+        if self.use_lane_topology:
+            # Relation order: successor, predecessor, left, right
+            self.topology_rel_proj = nn.ModuleList(
+                [nn.Linear(filter_size, filter_size, bias=False) for _ in range(4)]
+            )
+            self.topology_ln1 = nn.LayerNorm(filter_size)
+            self.topology_ffn = nn.Sequential(
+                nn.Linear(filter_size, filter_size * 4),
+                nn.ReLU(inplace=True),
+                nn.Linear(filter_size * 4, filter_size),
+            )
+            self.topology_ln2 = nn.LayerNorm(filter_size)
+
+    def _apply_lane_topology(self, lane_feat_shared, lane_topology, lane_valid):
+        """
+        Topology-aware lane feature refinement.
+        lane_feat_shared: [B, L, F]
+        lane_topology: [B, L, L, R] or [L, L, R], R>=4
+        lane_valid: [B, L] bool
+        """
+        if (not self.use_lane_topology) or lane_topology is None:
+            return lane_feat_shared
+        if lane_feat_shared is None:
+            return lane_feat_shared
+
+        B, L, F = lane_feat_shared.shape
+        topo = lane_topology
+        if topo.dim() == 3:
+            topo = topo.unsqueeze(0).expand(B, -1, -1, -1)
+        if topo.dim() != 4 or topo.shape[1] != L or topo.shape[2] != L:
+            return lane_feat_shared
+
+        topo = topo.to(device=lane_feat_shared.device)
+        topo = (topo > 0).to(dtype=lane_feat_shared.dtype)
+
+        valid_src = lane_valid.unsqueeze(1).to(dtype=lane_feat_shared.dtype)  # [B,1,L]
+        valid_dst = lane_valid.unsqueeze(2).to(dtype=lane_feat_shared.dtype)  # [B,L,1]
+
+        msg_sum = torch.zeros_like(lane_feat_shared)
+        n_rel = min(int(topo.shape[-1]), len(self.topology_rel_proj))
+        for r in range(n_rel):
+            adj = topo[..., r] * valid_src * valid_dst  # [B,L,L]
+            deg = adj.sum(dim=-1, keepdim=True).clamp(min=1.0)
+            neigh = torch.matmul(adj, self.topology_rel_proj[r](lane_feat_shared)) / deg
+            msg_sum = msg_sum + neigh
+
+        h = self.topology_ln1(lane_feat_shared + msg_sum)
+        h2 = self.topology_ffn(h)
+        out = self.topology_ln2(h + h2)
+        out = out * lane_valid.unsqueeze(-1).to(dtype=out.dtype)
+        return out
+
 
     def _extract_agent_anchor(self, history_data, history_timestep_mask, history_vehicle_mask, agent_valid_mask):
         """Compute last valid history position/velocity per agent for lane-related conditioning."""
@@ -1704,6 +1757,7 @@ class ContextEncoder(nn.Module):
         agent_shape=None,          # [B, V, 3] or None, normalized [length, width, height]
         map_data=None,             # [B, L, P, C]
         map_mask=None,             # [B, L, P] (True=real point)
+        lane_topology=None,        # [B, L, L, 4] optional lane graph edges
         traffic_light_data=None,   # [B, TL, C_tl]
         traffic_light_mask=None,   # [B, TL] (True=real point)
         history_data=None,         # [B, C, t, V] or None
@@ -1810,8 +1864,12 @@ class ContextEncoder(nn.Module):
         L = 0
         if (map_data is not None) and (map_mask is not None):
             lane_feat_shared = self.map_feature_extractor(map_data, map_mask)  # [B, L, F]
-            L = lane_feat_shared.shape[1]
+            lane_valid_mask_scene = map_mask.any(dim=-1)  # [B, L]
             lane_keep_mask = self._build_lane_center_mask(map_data, map_mask)
+            lane_feat_shared = self._apply_lane_topology(
+                lane_feat_shared, lane_topology, lane_valid_mask_scene & lane_keep_mask
+            )
+            L = lane_feat_shared.shape[1]
 
             selection_mode = self.lane_selection_mode
             if history_data is None and selection_mode != "all":
@@ -2219,6 +2277,7 @@ class Block(nn.Module):
         lane_selection_mode="topk",
         topk_lanes=16,
         hybrid_global_lanes=16,
+        use_lane_topology=True,
     ):
         super().__init__()
         squeeze_dim = in_channel * 2  # squeeze factor = 2
@@ -2391,6 +2450,7 @@ class Glow(nn.Module):
         lane_selection_mode="topk",
         topk_lanes=16,
         hybrid_global_lanes=16,
+        use_lane_topology=True,
     ):
         super().__init__()
         self.blocks = nn.ModuleList()
@@ -2415,6 +2475,7 @@ class Glow(nn.Module):
                 lane_selection_mode=lane_selection_mode,
                 topk_lanes=topk_lanes,
                 hybrid_global_lanes=hybrid_global_lanes,
+                use_lane_topology=use_lane_topology,
             )
             self.blocks.append(block)
             if shared_filter is None:
@@ -2426,6 +2487,7 @@ class Glow(nn.Module):
             n_flow,
             split=False,
             affine=affine,
+            conv_lu=conv_lu,
             max_points=max_points,
             map_input_dim=map_input_dim,
             traffic_light_input_dim=traffic_light_input_dim,
@@ -2438,6 +2500,7 @@ class Glow(nn.Module):
             lane_selection_mode=lane_selection_mode,
             topk_lanes=topk_lanes,
             hybrid_global_lanes=hybrid_global_lanes,
+            use_lane_topology=use_lane_topology,
         )
         self.blocks.append(final_block)
         if shared_filter is None:
@@ -2460,6 +2523,7 @@ class Glow(nn.Module):
             lane_type_embed_dim=lane_type_embed_dim,
             lane_tl_embed_dim=lane_tl_embed_dim,
             tl_state_embed_dim=tl_state_embed_dim,
+            use_lane_topology=use_lane_topology,
         )
         # Per-block lightweight adapters (zero-init => identity at start).
         self.block_context_adapters = nn.ModuleList(
@@ -2472,6 +2536,7 @@ class Glow(nn.Module):
         condition=None,
         map_data=None,
         map_mask=None,
+        lane_topology=None,
         traffic_light_data=None,
         traffic_light_mask=None,
         agent_types=None,
@@ -2504,6 +2569,7 @@ class Glow(nn.Module):
             agent_shape=agent_shape,
             map_data=map_data,
             map_mask=map_mask,
+            lane_topology=lane_topology,
             traffic_light_data=traffic_light_data,
             traffic_light_mask=traffic_light_mask,
             history_data=history_data,
@@ -2543,6 +2609,7 @@ class Glow(nn.Module):
         condition=None,
         map_data=None,
         map_mask=None,
+        lane_topology=None,
         traffic_light_data=None,
         traffic_light_mask=None,
         agent_types=None,
@@ -2583,6 +2650,7 @@ class Glow(nn.Module):
             agent_shape=agent_shape,
             map_data=map_data,
             map_mask=map_mask,
+            lane_topology=lane_topology,
             traffic_light_data=traffic_light_data,
             traffic_light_mask=traffic_light_mask,
             history_data=history_data,

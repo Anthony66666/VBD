@@ -24,7 +24,7 @@ init_from: null   # Resume training from lightning checkpoint
 ckpt_path: null   # Load model weights only
 
 # Scene Config (same as VBD)
-agents_len: 32      # Maximum number of agents
+agents_len: 64      # Maximum number of agents
 future_len: 80      # Future trajectory length (timesteps)
 history_len: 11     # History trajectory length (timesteps)
 
@@ -49,11 +49,12 @@ use_lane_tl_in_map: True    # debug开关：关闭map中的lane traffic light状
 lane_selection_mode: hybrid # topk / all / hybrid
 topk_lanes: 16               # used in topk/hybrid
 hybrid_global_lanes: 64      # extra global lanes in hybrid mode
+use_lane_topology: True      # use lane_topology graph message passing in ContextEncoder
 agent_shape_scale: [10.0, 5.0, 3.0]  # normalize [length, width, height]
 
 # Training Params (same as VBD)
 seed: 42
-batch_size: 4
+batch_size: 6
 num_workers: 0
 lr: 0.0002           # Reduced learning rate for normalizing flow stability
 weight_decay: 0.000001  # Reduced weight decay

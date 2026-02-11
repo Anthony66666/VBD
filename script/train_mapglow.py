@@ -325,7 +325,12 @@ def _plot_mapglow_sample(
         pad = np.zeros((A_pred, pred_len - pred_valid.shape[1]), dtype=bool)
         pred_valid = np.concatenate([pred_valid, pad], axis=1)
 
-    interested_mask = agents_interested > 0
+    # In our processed data:
+    # - agents_interested == 10: modeled / objects_of_interest
+    # - agents_interested == 1: other currently valid agents
+    # - agents_interested == 0: invalid/padding at current step
+    modeled_mask = agents_interested >= 10
+    present_mask = agents_interested > 0
     has_valid_pred = pred_valid.any(axis=1)
     has_valid_any = future_valid.any(axis=1)
     has_valid_current = np.abs(agents_history[:, -1, :2]).sum(axis=-1) > 0
@@ -334,7 +339,7 @@ def _plot_mapglow_sample(
     if draw_idx.size == 0:
         draw_idx = np.where(has_valid_pred)[0]
     if draw_idx.size == 0:
-        draw_idx = np.where(interested_mask)[0]
+        draw_idx = np.where(present_mask)[0]
     if draw_idx.size == 0:
         draw_idx = np.arange(min(max_agents, pred.shape[0]))
     else:
@@ -492,7 +497,7 @@ def _plot_mapglow_sample(
                     z=7,
                 )
             else:
-                is_interested = bool(interested_mask[i])
+                is_interested = bool(modeled_mask[i])
                 draw_agent_box(
                     ax,
                     cur_local[0],
@@ -506,7 +511,7 @@ def _plot_mapglow_sample(
                 )
 
         ax.set_aspect("equal", adjustable="box")
-        ax.set_title("MapGlow sample (local): interested box=blue, other valid box=gray, ego=purple")
+        ax.set_title("MapGlow sample (local): modeled/OOI box=blue, other valid box=gray, ego=purple")
         ax.axis("off")
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
         plt.close(fig)
@@ -545,7 +550,6 @@ def _plot_mapglow_sample(
                 gt_xy[~gt_mask] = np.nan
                 if np.isfinite(gt_xy).any():
                     ax.plot(gt_xy[:, 0], gt_xy[:, 1], color="#2ca02c", alpha=0.9, linewidth=1.6)
-
             ax.set_title("MapGlow sample: GT(green) vs Pred(red)")
             fig.savefig(save_path, dpi=150, bbox_inches="tight")
             plt.close(fig)
@@ -658,7 +662,7 @@ def _plot_mapglow_sample(
                         face_color="#8a2be2", edge_color="#000000", z=7
                     )
                 else:
-                    is_interested = bool(interested_mask[i])
+                    is_interested = bool(modeled_mask[i])
                     draw_agent_box(
                         ax, cur_xy[0], cur_xy[1], cur_yaw, agent_len, agent_wid,
                         face_color="#1f77b4" if is_interested else "#444444",
@@ -672,19 +676,26 @@ def _plot_mapglow_sample(
         pr[~pred_valid[i]] = np.nan
         if np.isfinite(pr).any():
             ax.plot(pr[:, 0], pr[:, 1], color="#d62728", alpha=0.9, linewidth=1.6)
-
-    ax.set_title("MapGlow sample: interested box=blue, other valid box=gray, ego=purple")
+    ax.set_title("MapGlow sample: modeled/OOI box=blue, other valid box=gray, ego=purple")
     ax.axis("off")
 
     if waymax_ok:
         from vbd.waymax_visualization import utils as viz_utils
         center_xy = None
-        for i in range(min(max_agents, agents_history.shape[0])):
-            if agents_interested[i] <= 0:
+        # Prefer modeled/OOI as center; fallback to any currently valid agent.
+        for i in range(agents_history.shape[0]):
+            if not modeled_mask[i]:
                 continue
             if np.abs(agents_history[i, -1, :2]).sum() > 0:
                 center_xy = agents_history[i, -1, :2]
                 break
+        if center_xy is None:
+            for i in range(agents_history.shape[0]):
+                if not present_mask[i]:
+                    continue
+                if np.abs(agents_history[i, -1, :2]).sum() > 0:
+                    center_xy = agents_history[i, -1, :2]
+                    break
         if center_xy is not None:
             viz_utils.center_at_xy(ax, center_xy, vis_config)
         img = viz_utils.img_from_fig(fig)
@@ -1175,12 +1186,18 @@ def build_parser():
                         help="Number of blocks")
     parser.add_argument("--condition_dim", type=int, default=None,
                         help="Condition dimension")
+    parser.add_argument("--use_lane_topology", type=int, default=None,
+                        help="Use lane_topology graph features (1=true, 0=false)")
     parser.add_argument("--trajectory_mode", type=str, default=None,
                         help="Trajectory representation: absolute or delta")
     parser.add_argument("--delta_pos_scale", type=float, default=None,
                         help="dx/dy normalization scale used only in delta mode")
-    parser.add_argument("--affine", action="store_true",
-                        help="Use affine coupling")
+    parser.add_argument(
+        "--affine",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Use affine coupling (--affine / --no-affine). Default: keep yaml value.",
+    )
     parser.add_argument("--temperature", type=float, default=None,
                         help="Sampling temperature")
     

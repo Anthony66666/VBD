@@ -69,6 +69,7 @@ class MapGlowWrapper(pl.LightningModule):
         self._lane_selection_mode = str(cfg.get('lane_selection_mode', 'hybrid')).lower()
         self._topk_lanes = int(cfg.get('topk_lanes', 16))
         self._hybrid_global_lanes = int(cfg.get('hybrid_global_lanes', 16))
+        self._use_lane_topology = bool(cfg.get('use_lane_topology', True))
         self._trajectory_mode = str(cfg.get('trajectory_mode', 'absolute')).lower()
         if self._trajectory_mode not in ('absolute', 'delta'):
             self._trajectory_mode = 'absolute'
@@ -100,6 +101,7 @@ class MapGlowWrapper(pl.LightningModule):
             lane_selection_mode=self._lane_selection_mode,
             topk_lanes=self._topk_lanes,
             hybrid_global_lanes=self._hybrid_global_lanes,
+            use_lane_topology=self._use_lane_topology,
         )
         
         # Normalization parameters for trajectory data
@@ -111,6 +113,7 @@ class MapGlowWrapper(pl.LightningModule):
         shape_scale_cfg = cfg.get('agent_shape_scale', [10.0, 5.0, 3.0])
         self.register_buffer('shape_scale', torch.tensor(shape_scale_cfg, dtype=torch.float32))
         self._warned_missing_sdc = False
+        self._warned_missing_lane_topology = False
 
     def _xyyaw_from_state5(self, traj5):
         """
@@ -227,6 +230,19 @@ class MapGlowWrapper(pl.LightningModule):
         vx = traj[:, 2]
         vy = traj[:, 3]
         dyaw = traj[:, 4]
+
+        if timestep_mask is not None:
+            valid = timestep_mask.bool()
+            contrib = torch.zeros_like(valid, dtype=dx.dtype)
+            contrib[:, 0, :] = valid[:, 0, :].to(dx.dtype)
+            if traj.size(2) > 1:
+                pair_valid = (valid[:, 1:, :] & valid[:, :-1, :]).to(dx.dtype)
+                contrib[:, 1:, :] = pair_valid
+            if anchor_valid is not None:
+                contrib[:, 0, :] = contrib[:, 0, :] * anchor_valid.to(dx.dtype)
+            dx = dx * contrib
+            dy = dy * contrib
+            dyaw = dyaw * contrib
 
         x = torch.cumsum(dx, dim=1)
         y = torch.cumsum(dy, dim=1)
@@ -419,17 +435,19 @@ class MapGlowWrapper(pl.LightningModule):
             target_data = torch.nan_to_num(target_data, nan=0.0, posinf=0.0, neginf=0.0)
         
         # Create masks FIRST (before normalization so we can use them)
-        # Vehicle mask: True if agent is valid (interested > 0)
-        vehicle_mask = agents_interested > 0  # [B, A]
-        
         # Timestep mask from explicit valid bits: [B, T, V]
         future_valid = agents_future_valid[:, :, 1:]  # [B, A, T]
         timestep_mask = future_valid.permute(0, 2, 1).bool()  # [B, T, A]
         
-        # Additional check: if an agent has NO valid future timesteps at all, mark it as invalid
-        # This prevents all-zero agents from causing numerical issues
+        # Train on interested agents (as in original setup), while requiring
+        # at least one valid future timestep for numerical safety.
         has_any_valid_timestep = timestep_mask.any(dim=1)  # [B, A] - True if agent has at least one valid timestep
-        vehicle_mask = vehicle_mask & has_any_valid_timestep  # Combine both conditions
+        vehicle_mask = (agents_interested > 0) & has_any_valid_timestep
+        # IMPORTANT: keep timestep_mask aligned with supervised agents.
+        # Otherwise non-supervised agents still contribute to Glow log_p/logdet
+        # (through gaussian mask / flow masks), while loss normalization only
+        # counts supervised agents, causing biased training.
+        timestep_mask = timestep_mask & vehicle_mask.unsqueeze(1)
 
         # History mask from explicit valid bits
         history_valid = agents_history_valid.bool()  # [B, A, T_hist]
@@ -482,30 +500,30 @@ class MapGlowWrapper(pl.LightningModule):
         history_data = self.normalize_trajectory(history_data, use_delta_xy=False)
         target_data = self.normalize_trajectory(target_data, use_delta_xy=self._use_delta_trajectory)
         
-        # Apply masks to zero out invalid data (important for numerical stability)
-        # For completely invalid agents, replace with small non-zero values to avoid division by zero
-        # Mask invalid agents
-        valid_agent_mask = vehicle_mask.float().unsqueeze(1).unsqueeze(2)  # [B, 1, 1, A]
-        
-        # For invalid agents, set to small constant values instead of zero
-        # This prevents issues in normalizing flow when processing all-zero inputs
-        target_data = target_data * valid_agent_mask + (1 - valid_agent_mask) * 1e-6
-        history_data = history_data * valid_agent_mask + (1 - valid_agent_mask) * 1e-6
-        
-        # Mask invalid timesteps (but keep non-zero for invalid agents from above)
-        timestep_valid_mask = timestep_mask.float().unsqueeze(1)  # [B, 1, T, A]
-        # Only apply timestep mask to valid agents
-        target_data = torch.where(
-            valid_agent_mask.expand_as(target_data) > 0,
-            target_data * timestep_valid_mask + (1 - timestep_valid_mask) * 1e-6,
-            target_data  # Keep the 1e-6 values for invalid agents
-        )
+        # Apply masks to invalid positions.
+        # Target branch should follow training supervision mask (vehicle_mask + timestep_mask).
+        # History branch should follow history validity, otherwise agents with valid history but
+        # no future supervision become fake zero agents and pollute interaction features.
+        target_agent_mask = vehicle_mask.float().unsqueeze(1).unsqueeze(2)  # [B, 1, 1, A]
+        target_time_mask = timestep_mask.float().unsqueeze(1)  # [B, 1, T, A]
+        target_data = target_data * target_agent_mask * target_time_mask
+
+        history_agent_mask = history_vehicle_mask.float().unsqueeze(1).unsqueeze(2)  # [B, 1, 1, A]
+        history_time_mask = history_timestep_mask.float().unsqueeze(1)  # [B, 1, T_hist, A]
+        history_data = history_data * history_agent_mask * history_time_mask
         
         # Prepare map data - transform to local frame
         polylines = batch['polylines']  # [B, L, P, 5] - x, y, heading, traffic_light, lane_type
         polylines_valid = batch['polylines_valid']  # [B, L]
         polyline_ids = batch.get('polyline_ids', None)  # [B, L], optional roadgraph ids
         lane_topology = batch.get('lane_topology', None)  # [B, L, L, 4], optional
+        if self._use_lane_topology and (lane_topology is None) and (not self._warned_missing_lane_topology):
+            print(
+                "Warning: use_lane_topology=True but batch has no lane_topology field. "
+                "Topology branch is effectively disabled for this dataset.",
+                flush=True,
+            )
+            self._warned_missing_lane_topology = True
         polyline_point_valid = batch.get('polylines_point_valid', None)
         if polyline_point_valid is None:
             polyline_point_valid = polylines[..., :2].abs().sum(-1) > self._valid_eps
@@ -870,6 +888,7 @@ class MapGlowWrapper(pl.LightningModule):
             condition=None,  # MapGlow expects integer labels, we don't use it
             map_data=inputs['map_data'],
             map_mask=inputs['map_mask'],
+            lane_topology=inputs.get('lane_topology', None),
             traffic_light_data=inputs['traffic_light_data'],
             traffic_light_mask=inputs['traffic_light_mask'],
             agent_types=inputs['agent_types'],
@@ -1111,6 +1130,7 @@ class MapGlowWrapper(pl.LightningModule):
             condition=None,  # MapGlow expects integer labels, we don't use it
             map_data=inputs['map_data'],
             map_mask=inputs['map_mask'],
+            lane_topology=inputs.get('lane_topology', None),
             traffic_light_data=inputs['traffic_light_data'],
             traffic_light_mask=inputs['traffic_light_mask'],
             agent_types=inputs['agent_types'],
@@ -1236,6 +1256,7 @@ class MapGlowWrapper(pl.LightningModule):
                 condition=None,  # MapGlow expects integer labels, we don't use it
                 map_data=inputs['map_data'],
                 map_mask=inputs['map_mask'],
+                lane_topology=inputs.get('lane_topology', None),
                 traffic_light_data=inputs['traffic_light_data'],
                 traffic_light_mask=inputs['traffic_light_mask'],
                 agent_types=inputs['agent_types'],
@@ -1348,6 +1369,7 @@ class MapGlowWrapper(pl.LightningModule):
             condition=None,  # MapGlow expects integer labels, we don't use it
             map_data=inputs['map_data'],
             map_mask=inputs['map_mask'],
+            lane_topology=inputs.get('lane_topology', None),
             traffic_light_data=inputs['traffic_light_data'],
             traffic_light_mask=inputs['traffic_light_mask'],
             agent_types=inputs['agent_types'],
